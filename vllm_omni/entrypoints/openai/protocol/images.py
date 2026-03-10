@@ -105,6 +105,18 @@ class ImageGenerationRequest(BaseModel):
         ),
     )
 
+    # HunyuanImage-3.0 chain-of-thought reasoning
+    bot_task: str | None = Field(
+        default=None,
+        description=(
+            "Bot task for HunyuanImage-3.0 CoT reasoning. "
+            "Options: 'think_recaption' (think then recaption before diffusion), "
+            "'recaption' (recaption only), 'think' (think only), "
+            "'image' (direct generation, no CoT). "
+            "Ignored by models that do not support it."
+        ),
+    )
+
     # VAE memory optimizations (set at model init, included for completeness)
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
@@ -115,7 +127,7 @@ class ImageData(BaseModel):
 
     b64_json: str | None = Field(default=None, description="Base64-encoded PNG image")
     url: str | None = Field(default=None, description="Image URL (not implemented)")
-    revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
+    revised_prompt: str | None = Field(default=None, description="Revised prompt from CoT reasoning, if available")
 
 
 class ImageGenerationResponse(BaseModel):

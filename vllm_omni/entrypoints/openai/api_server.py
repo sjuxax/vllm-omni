@@ -1215,6 +1215,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
 
+        # Pass model-specific extra_args
+        if request.bot_task is not None:
+            gen_params.extra_args["bot_task"] = request.bot_task
+
         request_id = f"img_gen_{uuid.uuid4().hex}"
 
         logger.info(f"Generating {request.n} image(s) {size_str}")
@@ -1239,8 +1243,11 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
+        # Extract CoT text as revised_prompt if available
+        revised_prompt = _extract_revised_prompt(result)
+
         # Encode images to base64
-        image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
+        image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=revised_prompt) for img in images]
 
         return ImageGenerationResponse(
             created=int(time.time()),
@@ -1390,13 +1397,16 @@ async def edit_images(
         images = _extract_images_from_result(result)
         logger.info(f"Successfully generated {len(images)} image(s)")
 
+        # Extract CoT text as revised_prompt if available
+        revised_prompt = _extract_revised_prompt(result)
+
         # Encode images to base64
         image_data = [
             ImageData(
                 b64_json=_encode_image_base64_with_compression(
                     img, format=output_format, output_compression=output_compression
                 ),
-                revised_prompt=None,
+                revised_prompt=revised_prompt,
             )
             for img in images
         ]
@@ -1590,6 +1600,19 @@ def _extract_images_from_result(result: Any) -> list[Any]:
         elif hasattr(request_output, "images") and request_output.images:
             images = request_output.images
     return images
+
+
+def _extract_revised_prompt(result: Any) -> str | None:
+    """Extract CoT text from custom_output and return as revised_prompt."""
+    custom_output = getattr(result, "custom_output", None) or {}
+    cot_text = custom_output.get("cot_text")
+    if cot_text:
+        # cot_text is a list (one per batch item); return the first.
+        if isinstance(cot_text, list) and len(cot_text) > 0:
+            return cot_text[0]
+        if isinstance(cot_text, str):
+            return cot_text
+    return None
 
 
 async def _load_input_images(

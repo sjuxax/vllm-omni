@@ -11,7 +11,8 @@ import torch.nn as nn
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from PIL import Image as PILImage
 from transformers.generation.configuration_utils import GenerationConfig
-from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
+from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin, LogitsProcessorList
+from transformers.generation.logits_process import LogitsProcessor
 from transformers.models.siglip2 import Siglip2VisionConfig, Siglip2VisionModel
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
@@ -26,6 +27,7 @@ from vllm_omni.inputs.data import OmniTextPrompt
 
 from .autoencoder import AutoencoderKLConv3D
 from .hunyuan_image_3_tokenizer import TokenizerWrapper
+from .system_prompt import get_system_prompt
 from .hunyuan_image_3_transformer import (
     CausalMMOutputWithPast,
     HunyuanImage3ImageProcessor,
@@ -345,8 +347,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             "lm_head",
             "patch_embed",
             "timestep_emb",
-            "model.wte",
-            "model.ln_f",
+            "model.embed_tokens",
+            "model.norm",
             "time_embed",
             "time_embed_2",
             "final_layer.model",
@@ -897,24 +899,27 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         tokenizer_output=None,
         batch_gen_image_info=None,
         generator=None,
+        position_ids=None,
+        custom_pos_emb=None,
+        mode=None,
         **kwargs,
     ):
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
-            if input_ids.shape[1] != kwargs["position_ids"].shape[1]:  # in decode steps
-                input_ids = torch.gather(input_ids, dim=1, index=kwargs["position_ids"])
+            if input_ids.shape[1] != position_ids.shape[1]:  # in decode steps
+                input_ids = torch.gather(input_ids, dim=1, index=position_ids)
             model_inputs = {"input_ids": input_ids}
 
         model_inputs.update(
             {
                 "attention_mask": attention_mask,
-                "position_ids": kwargs["position_ids"],
+                "position_ids": position_ids,
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
-                "custom_pos_emb": kwargs["custom_pos_emb"],
-                "mode": kwargs["mode"],
+                "custom_pos_emb": custom_pos_emb,
+                "mode": mode,
                 "images": kwargs.get("images"),
                 "image_mask": kwargs.get("image_mask"),
                 "timestep": kwargs.get("timestep"),
@@ -997,6 +1002,52 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
 
         return updated_model_kwargs
 
+    class _StageTransitionLogitsProcessor(LogitsProcessor):
+        """Logits processor that implements multi-stage text generation.
+
+        When a stage-transition stop token is generated, the processor forces
+        the model to emit the corresponding inject tokens before resuming
+        free generation.  Each transition fires at most once per batch element.
+        """
+
+        def __init__(self, stage_transitions: list[tuple[int, list[int]]], batch_size: int):
+            # stage_transitions: [(stop_token_id, [inject_token_ids, ...]), ...]
+            self.transition_map = {stop_id: list(append_ids) for stop_id, append_ids in stage_transitions}
+            self.pending_tokens: list[list[int]] = [[] for _ in range(batch_size)]
+            self.completed: list[set[int]] = [set() for _ in range(batch_size)]
+
+        def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+            batch_size = input_ids.shape[0]
+            last_tokens = input_ids[:, -1]
+            device = scores.device
+            min_score = torch.finfo(scores.dtype).min
+
+            for i in range(batch_size):
+                last_token = last_tokens[i].item()
+
+                # Consume pending tokens if the last token matches the head.
+                if self.pending_tokens[i] and last_token == self.pending_tokens[i][0]:
+                    self.pending_tokens[i].pop(0)
+
+                # If pending tokens remain, force the next token.
+                if self.pending_tokens[i]:
+                    scores[i].fill_(min_score)
+                    scores[i, self.pending_tokens[i][0]] = 0
+                    continue
+
+                # Trigger stage transition if needed.
+                if last_token in self.transition_map and last_token not in self.completed[i]:
+                    self.completed[i].add(last_token)
+                    next_tokens = self.transition_map[last_token]
+                    if next_tokens:
+                        self.pending_tokens[i] = list(next_tokens)
+                        scores[i].fill_(min_score)
+                        scores[i, self.pending_tokens[i][0]] = 0
+
+                scores[i] = scores[i].to(device)
+
+            return scores
+
     def _generate(
         self,
         generator: list[torch.Generator] | None = None,
@@ -1005,7 +1056,44 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         mode = kwargs.get("mode", "gen_text")
         # verbose > 1 not support
         if mode == "gen_text":
-            raise NotImplementedError("Not support gen text for hunyuan image")
+            # Text generation mode for CoT reasoning (think / recaption).
+            # We call the HuggingFace GenerationMixin.generate() which drives
+            # the autoregressive loop through our forward() → lm_head path.
+            stage_transitions = kwargs.pop("stage_transitions", None)
+            final_stop_tokens = kwargs.pop("final_stop_tokens", None)
+            logits_processor = kwargs.pop("logits_processor", None)
+
+            if stage_transitions is not None:
+                if final_stop_tokens is None:
+                    raise ValueError("`final_stop_tokens` must be provided when `stage_transitions` is set.")
+                if logits_processor is None:
+                    logits_processor = LogitsProcessorList()
+                elif not isinstance(logits_processor, LogitsProcessorList):
+                    logits_processor = LogitsProcessorList(logits_processor)
+                input_ids = kwargs.get("input_ids")
+                if input_ids is None:
+                    raise ValueError("`input_ids` must be provided for multi-stage generation.")
+                logits_processor.append(
+                    self._StageTransitionLogitsProcessor(stage_transitions, input_ids.shape[0])
+                )
+                kwargs["eos_token_id"] = final_stop_tokens
+
+            # Strip diffusion-only keys that GenerationMixin.generate() doesn't expect
+            gen_kwargs = {k: v for k, v in kwargs.items() if k not in (
+                "batch_gen_image_info", "num_inference_steps", "guidance_scale",
+                "num_image_tokens", "image_mask", "gen_timestep_scatter_index",
+                "cond_vae_images", "cond_timestep", "cond_vae_image_mask",
+                "cond_vit_images", "cond_vit_image_mask", "vit_kwargs",
+                "cond_timestep_scatter_index",
+            )}
+
+            with torch.autocast(device_type="cuda", dtype=self.dtype, enabled=self.dtype != torch.float32):
+                samples = self.generate(
+                    do_sample=False,
+                    logits_processor=logits_processor,
+                    **gen_kwargs,
+                )
+            return samples
 
         elif mode == "gen_image":
             batch_gen_image_info: list[ImageInfo] = kwargs.get("batch_gen_image_info")
@@ -1034,13 +1122,109 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         else:
             raise ValueError(f"Unknown mode {mode}, only `gen_text` and `gen_image` are supported.")
 
+    def _generate_cot_text(
+        self,
+        prompt,
+        system_prompt,
+        image_size,
+        bot_task,
+        batch_cond_image_info=None,
+        max_new_tokens=2048,
+        **kwargs,
+    ):
+        """Generate chain-of-thought text using multi-stage autoregressive generation.
+
+        For ``bot_task="think_recaption"``:
+          Stage 1 – generate ``<think>...</think>``
+          Stage 2 – generate ``<recaption>...</recaption>``
+
+        For ``bot_task="think"``:
+          Generate ``<think>...</think>`` only.
+
+        For ``bot_task="recaption"``:
+          Generate ``<recaption>...</recaption>`` only.
+
+        Returns:
+            list[str]: The generated CoT text strings (one per batch element),
+                       each wrapped with the appropriate special tokens.
+        """
+        tkw = self._tkwrapper
+        first_bot_task = bot_task.split("_")[0]  # "think" for "think_recaption"
+
+        # Build stage transitions ------------------------------------------------
+        stage_transitions: list[tuple[int, list[int]]] = []
+        if first_bot_task == "think" and "recaption" in bot_task:
+            # After </think>, inject <recaption> to start the recaption stage
+            stage_transitions.append(
+                (tkw.end_think_token_id, [tkw.recaption_token_id])
+            )
+
+        # Determine final stop tokens -------------------------------------------
+        if "recaption" in bot_task:
+            final_stop_tokens = [tkw.end_recaption_token_id]
+        else:
+            final_stop_tokens = [tkw.end_think_token_id, tkw.end_recaption_token_id]
+
+        # Prepare model inputs for text generation ------------------------------
+        model_inputs = self.prepare_model_inputs(
+            prompt=prompt,
+            mode="gen_text",
+            system_prompt=system_prompt,
+            max_new_tokens=max_new_tokens,
+            image_size=image_size,
+            bot_task=first_bot_task,
+            batch_cond_image_info=batch_cond_image_info,
+            **kwargs,
+        )
+
+        input_length = model_inputs["input_ids"].shape[1]
+
+        # Run text generation with stage transitions ----------------------------
+        outputs = self._generate(
+            **model_inputs,
+            stage_transitions=stage_transitions if stage_transitions else None,
+            final_stop_tokens=final_stop_tokens if stage_transitions else None,
+        )
+
+        # Extract CoT text from generated tokens --------------------------------
+        generated_tokens = outputs[:, input_length:]
+        if "recaption" in bot_task:
+            end_token_id = tkw.end_recaption_token_id
+        else:
+            end_token_id = tkw.end_think_token_id
+
+        end_positions = (generated_tokens[0] == end_token_id).nonzero(as_tuple=False)
+        if end_positions.numel() > 0:
+            end_pos = end_positions[0].item()
+            cot_tokens = generated_tokens[0, : end_pos + 1]
+        else:
+            cot_tokens = generated_tokens[0]
+
+        cot_text_gen = tkw.decode(cot_tokens)
+
+        if first_bot_task == "think":
+            cot_text = ["<think>" + cot_text_gen]
+        else:
+            cot_text = ["<recaption>" + cot_text_gen]
+
+        # Optionally drop think part, keeping only recaption --------------------
+        drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
+        if drop_think and "<think>" in cot_text[0]:
+            if "<recaption>" in cot_text[0]:
+                recaption_part = cot_text[0].split("<recaption>")[1]
+                if "</recaption>" in recaption_part:
+                    recaption_part = recaption_part.split("</recaption>")[0]
+                cot_text = ["<recaption>" + recaption_part + "</recaption>"]
+
+        return cot_text
+
     @staticmethod
     def _check_inputs(cond, target, check_list):
         if cond:
             for name, item in check_list:
                 assert item is not None, f"`{name}` should be provided when `{target}`."
 
-    def forward_call(
+    def forward(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -1166,7 +1350,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
 
         if mode == "gen_text":
-            hidden_states = self.model.ln_f(hidden_states)
+            hidden_states = self.model.norm(hidden_states)
             logits = self.lm_head(hidden_states)
             logits = logits.float()
             diffusion_prediction = None
@@ -1195,7 +1379,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
 
         return output
 
-    def forward(
+    def pipeline_forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | list[str] = "",
@@ -1241,9 +1425,42 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             logger.warning("HunyuanImage3.0 does not support guidance_scale <= 1.0, will set it to 1.0 + epsilon.")
             guidance_scale = 1.0 + np.finfo(float).eps
         image_size = (height, width)
+
+        # Extract bot_task from request extra_args (default: "image" = no CoT)
+        bot_task = req.sampling_params.extra_args.get("bot_task", "image")
+
+        # ── Stage 1: Chain-of-thought text generation (optional) ──────────
+        cot_text = None
+        if bot_task in ("think", "recaption", "think_recaption"):
+            # Resolve system prompt for CoT mode
+            cot_system_prompt = system_prompt
+            if cot_system_prompt is None:
+                cot_system_prompt = get_system_prompt(
+                    sys_type="dynamic",
+                    bot_task=bot_task.split("_")[0],  # "think" for "think_recaption"
+                )
+
+            cot_text = self._generate_cot_text(
+                prompt=prompt,
+                system_prompt=cot_system_prompt,
+                image_size=image_size,
+                bot_task=bot_task,
+                batch_cond_image_info=batch_cond_image_info,
+                **kwargs,
+            )
+            logger.info("Generated CoT text: %s", cot_text[0][:200] + "..." if len(cot_text[0]) > 200 else cot_text[0])
+
+            # If drop_think stripped the <think> block, also switch system prompt
+            # to the recaption variant for the image generation stage.
+            drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
+            if drop_think and system_prompt is None and cot_text[0].startswith("<recaption>"):
+                cot_system_prompt = get_system_prompt(sys_type="en_recaption", bot_task=bot_task)
+            system_prompt = cot_system_prompt
+
+        # ── Stage 2: Image generation (with or without CoT context) ───────
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
-            cot_text=None,
+            cot_text=cot_text,
             system_prompt=system_prompt,
             mode="gen_image",
             generator=generator,
@@ -1253,4 +1470,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
             batch_cond_image_info=batch_cond_image_info,
         )
         outputs = self._generate(**model_inputs, **kwargs)
-        return DiffusionOutput(output=outputs[0])
+
+        custom_output = {}
+        if cot_text is not None:
+            custom_output["cot_text"] = cot_text
+        return DiffusionOutput(output=outputs[0], custom_output=custom_output)

@@ -225,7 +225,9 @@ class DiffusionModelRunner:
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+                    output = (self.pipeline.pipeline_forward(req)
+                              if hasattr(self.pipeline, 'pipeline_forward')
+                              else self.pipeline.forward(req))
 
             # NOTE:
             if (

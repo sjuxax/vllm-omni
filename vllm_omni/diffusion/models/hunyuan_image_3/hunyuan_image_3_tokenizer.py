@@ -56,6 +56,9 @@ class TokenizerWrapper:
         self.cfg_token_id = self.tokenizer.convert_tokens_to_ids("<cfg>")
         self.end_answer_token_id = self.tokenizer.convert_tokens_to_ids("</answer>")
         self.end_recaption_token_id = self.tokenizer.convert_tokens_to_ids("</recaption>")
+        self.end_think_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
+        self.think_token_id = self.tokenizer.convert_tokens_to_ids("<think>")
+        self.recaption_token_id = self.tokenizer.convert_tokens_to_ids("<recaption>")
         self.ratio_token_offset = self.tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self.special_token_map = self.tokenizer.added_tokens_encoder
 

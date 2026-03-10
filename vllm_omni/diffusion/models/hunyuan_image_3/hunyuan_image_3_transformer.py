@@ -1514,6 +1514,16 @@ class HunYuanAttention(nn.Module):
             # quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
+        # Separate causal attention for gen_text (language model) mode.
+        # self.attn is non-causal for gen_image; gen_text needs causal masking.
+        self.text_attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            causal=True,
+            softmax_scale=self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            prefix=f"{prefix}.text_attn",
+        )
 
         # default image_token_len = timestamp + 4096*image_tokes
         self.image_attn = ImageKVCacheManager(image_token_len=4097)
@@ -1541,28 +1551,65 @@ class HunYuanAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         past_key_value: Cache | None = kwargs.get("past_key_value", None)
-        if past_key_value is not None:
-            position_ids = kwargs.get("position_ids")
-            key_states = k.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = v.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            cache_kwargs = {"cache_position": position_ids}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_id, cache_kwargs)
-        # for image_generation
-        if kwargs.get("mode", "gen_text") == "gen_image":
-            # assert positions is None, "positions should be None for image attention"
+        is_gen_image = kwargs.get("mode", "gen_text") == "gen_image"
+
+        # Apply rotary position embedding.
+        # For gen_image, image_rope2d_emb handles 2D RoPE.
+        # For gen_text, we apply custom_pos_emb (cos, sin) directly.
+        if is_gen_image:
             q, k = self.image_rope2d_emb(q, k, hidden_states, custom_pos_emb, **kwargs)
         else:
-            q, k = self.rotary_emb(positions, q, k)
+            # gen_text: apply custom_pos_emb (cos, sin) directly
+            cos, sin = custom_pos_emb
+            q_r = q.reshape(bsz, q_len, self.num_heads, self.head_dim)
+            k_r = k.reshape(bsz, q_len, self.num_kv_heads, self.head_dim)
+            q_r = self.image_rope2d_emb.rope(q_r.to(torch.float32), cos, sin)
+            k_r = self.image_rope2d_emb.rope(k_r.to(torch.float32), cos, sin)
+            q = q_r.reshape(bsz * q_len, self.num_heads * self.head_dim).to(hidden_states.dtype)
+            k = k_r.reshape(bsz * q_len, self.num_kv_heads * self.head_dim).to(hidden_states.dtype)
+
         if self.use_qk_norm:
             q = self.query_layernorm(q.view(-1, self.num_heads, self.head_dim).contiguous())
             k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
-        # for image_generation
-        if kwargs.get("mode", "gen_text") == "gen_image":
+
+        # KV cache update for gen_text (after RoPE + QK norm, matching the
+        # reference impl ordering so cached keys carry positional info).
+        if past_key_value is not None and not is_gen_image:
+            position_ids = kwargs.get("position_ids")
+            # k is [bsz*q_len, kv_heads*head_dim] or [bsz*q_len, kv_heads, head_dim]
+            key_states = k.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = v.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            cache_kwargs = {"cache_position": position_ids}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_id, cache_kwargs
+            )
+
+        # Attention computation
+        if is_gen_image:
             attn_output = self.image_attn(q, k, v, attention_mask=attention_mask, **kwargs)
         else:
-            attn_output = self.attn(q, k, v)
+            # gen_text: use FA-backed causal attention via self.text_attn.
+            # Reshape q to 4D [bsz, seq_len, heads, head_dim] for flash_attn_func.
+            q_4d = q.reshape(bsz, q_len, self.num_heads, self.head_dim)
+            if past_key_value is not None:
+                # Decode step: k/v come from cache in [bsz, heads, full_seq, head_dim].
+                # Transpose to [bsz, full_seq, heads, head_dim] for FA.
+                k_4d = key_states.transpose(1, 2).contiguous()
+                v_4d = value_states.transpose(1, 2).contiguous()
+            else:
+                # Prefill: reshape from flat to 4D.
+                k_4d = k.reshape(bsz, q_len, self.num_kv_heads, self.head_dim)
+                v_4d = v.reshape(bsz, q_len, self.num_kv_heads, self.head_dim)
+            # Cast to consistent dtype for FA.
+            q_4d = q_4d.to(v_4d.dtype)
+            k_4d = k_4d.to(v_4d.dtype)
+            # FA handles GQA natively (different num_heads vs num_kv_heads).
+            attn_output = self.text_attn(q_4d, k_4d, v_4d)
+            # Output is [bsz, q_len, num_heads, head_dim].
+            # Reshape to [bsz*q_len, num_heads, head_dim] for o_proj.
+            attn_output = attn_output.reshape(bsz * q_len, self.num_heads, self.head_dim)
         # For o_proj
-        attn_output = attn_output.view(q.shape[0], -1)
+        attn_output = attn_output.reshape(bsz * q_len, -1)
         output, _ = self.o_proj(attn_output)
         output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value
@@ -2424,7 +2471,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 )
 
                 with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                    model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                    model_output = self.model.forward(**model_inputs, first_step=(i == 0))
                     pred = model_output["diffusion_prediction"]
                 pred = pred.to(dtype=torch.float32)
 
