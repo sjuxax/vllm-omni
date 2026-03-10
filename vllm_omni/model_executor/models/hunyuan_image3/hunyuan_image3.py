@@ -1237,7 +1237,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vision_output = self.vision_model(
             pixel_values, attention_mask=vit_attention_mask, spatial_shapes=vit_spatial_shapes
         )
-        image_embed = vision_output.last_hidden_state
+        image_embed = vision_output.last_hidden_state if hasattr(vision_output, "last_hidden_state") else vision_output[0]
         image_embed = self.vision_aligner(image_embed)
         return image_embed
 

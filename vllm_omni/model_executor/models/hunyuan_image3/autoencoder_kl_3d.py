@@ -4,22 +4,56 @@ Reference code
 [DCAE] https://github.com/mit-han-lab/efficientvit/blob/master/efficientvit/models/efficientvit/dc_ae.py
 """
 
+import inspect
 import math
 import random
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.utils import BaseOutput
-from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import Tensor, nn
+
+
+class Autoencoder3DConfig:
+    def __init__(self, config: Mapping[str, object] | None = None, **kwargs: object):
+        data = dict(config or {})
+        data.update(kwargs)
+        self._data = data
+        for key, value in data.items():
+            setattr(self, key, value)
+
+    @classmethod
+    def from_dict(cls, config: "Autoencoder3DConfig | Mapping[str, object] | object") -> "Autoencoder3DConfig":
+        if isinstance(config, cls):
+            return config
+        if isinstance(config, Mapping):
+            return cls(config)
+        if hasattr(config, "to_dict"):
+            return cls(config.to_dict())
+        if hasattr(config, "__dict__"):
+            return cls(vars(config))
+        raise TypeError(f"Unsupported autoencoder config type: {type(config)}")
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def get(self, key: str, default: object = None):
+        return getattr(self, key, default)
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(self._data)
+
+    def to_init_kwargs(self, model_class: type[nn.Module]) -> dict[str, object]:
+        sig = inspect.signature(model_class.__init__)
+        allowed_keys = {name for name in sig.parameters if name != "self"}
+        kwargs = {k: v for k, v in self._data.items() if not k.startswith("_") and k in allowed_keys}
+        if "block_out_channels" in kwargs:
+            kwargs["block_out_channels"] = tuple(kwargs["block_out_channels"])
+        return kwargs
 
 
 class DiagonalGaussianDistribution:
@@ -43,7 +77,7 @@ class DiagonalGaussianDistribution:
 
     def sample(self, generator: torch.Generator | None = None) -> torch.FloatTensor:
         # make sure sample is on the same device as the parameters and has same dtype
-        sample = randn_tensor(
+        sample = torch.randn(
             self.mean.shape,
             generator=generator,
             device=self.parameters.device,
@@ -86,7 +120,12 @@ class DiagonalGaussianDistribution:
 
 
 @dataclass
-class DecoderOutput(BaseOutput):
+class AutoencoderKLOutput:
+    latent_dist: DiagonalGaussianDistribution
+
+
+@dataclass
+class DecoderOutput:
     sample: torch.FloatTensor
     posterior: DiagonalGaussianDistribution | None = None
 
@@ -442,10 +481,9 @@ class Decoder(nn.Module):
         return h
 
 
-class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
+class AutoencoderKLConv3D(nn.Module):
     _supports_gradient_checkpointing = True
 
-    @register_to_config
     def __init__(
         self,
         in_channels: int,
@@ -465,6 +503,24 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         only_decoder: bool = False,
     ):
         super().__init__()
+        block_out_channels = tuple(block_out_channels)
+        self.config = Autoencoder3DConfig(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            latent_channels=latent_channels,
+            block_out_channels=block_out_channels,
+            layers_per_block=layers_per_block,
+            ffactor_spatial=ffactor_spatial,
+            ffactor_temporal=ffactor_temporal,
+            sample_size=sample_size,
+            sample_tsize=sample_tsize,
+            scaling_factor=scaling_factor,
+            shift_factor=shift_factor,
+            downsample_match_channel=downsample_match_channel,
+            upsample_match_channel=upsample_match_channel,
+            only_encoder=only_encoder,
+            only_decoder=only_decoder,
+        )
         self.ffactor_spatial = ffactor_spatial
         self.ffactor_temporal = ffactor_temporal
         self.scaling_factor = scaling_factor
@@ -506,7 +562,12 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         self.use_compile = False
 
-        self.empty_cache = torch.empty(0, device="cuda")
+        self.register_buffer("empty_cache", torch.empty(0), persistent=False)
+
+    @classmethod
+    def from_config(cls, config: Autoencoder3DConfig | Mapping[str, object] | object) -> "AutoencoderKLConv3D":
+        config_obj = Autoencoder3DConfig.from_dict(config)
+        return cls(**config_obj.to_init_kwargs(cls))
 
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (Encoder, Decoder)):
@@ -786,7 +847,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         dec = torch.cat(result_row, dim=-3)
         return dec
 
-    def encode(self, x: Tensor, return_dict: bool = True):
+    def encode(self, x: Tensor, return_dict: bool = True) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
         def _encode(x):
             if self.use_temporal_tiling and x.shape[-3] > self.tile_sample_min_tsize:
                 return self.temporal_tiled_encode(x)
@@ -830,7 +891,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def decode(self, z: Tensor, return_dict: bool = True, generator=None):
+    def decode(self, z: Tensor, return_dict: bool = True, generator=None) -> DecoderOutput | tuple[Tensor]:
         def _decode(z):
             if self.use_temporal_tiling and z.shape[-3] > self.tile_latent_min_tsize:
                 return self.temporal_tiled_decode(z)
@@ -847,7 +908,10 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
             decoded = _decode(z)
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() != 0:
-                return self.empty_cache
+                empty = self.empty_cache.to(device=z.device, dtype=decoded.dtype)
+                if not return_dict:
+                    return (empty,)
+                return DecoderOutput(sample=empty)
 
         if z.shape[-3] == 1:
             decoded = decoded[:, :, -1:]
@@ -859,7 +923,7 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
     def decode_dist(self, z: Tensor, return_dict: bool = True, generator=None):
         z = z.cuda()
         self.use_spatial_tiling = True
-        decoded = self.decode(z)
+        decoded = self.decode(z, return_dict=return_dict)
         self.use_spatial_tiling = False
         return decoded
 

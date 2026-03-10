@@ -27,13 +27,13 @@
 # ==============================================================================
 
 import warnings
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
-from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
 
 class Config:
@@ -47,6 +47,21 @@ class Config:
 
     def __setitem__(self, key, value):
         return setattr(self, key, value)
+
+
+@dataclass
+class Siglip2EncoderOutput:
+    last_hidden_state: torch.Tensor
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    attentions: tuple[torch.Tensor, ...] | None = None
+
+
+@dataclass
+class Siglip2VisionOutput:
+    last_hidden_state: torch.Tensor
+    pooler_output: torch.Tensor | None = None
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    attentions: tuple[torch.Tensor, ...] | None = None
 
 
 class Siglip2VisionEmbeddings(nn.Module):
@@ -382,7 +397,7 @@ class Siglip2Encoder(nn.Module):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-    ) -> tuple | BaseModelOutput:
+    ) -> tuple | Siglip2EncoderOutput:
         r"""
         Args:
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -433,7 +448,11 @@ class Siglip2Encoder(nn.Module):
 
         if not return_dict:
             return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
-        return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions)
+        return Siglip2EncoderOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=encoder_states,
+            attentions=all_attentions,
+        )
 
 
 class Siglip2MultiheadAttentionPoolingHead(nn.Module):
@@ -490,7 +509,7 @@ class Siglip2VisionTransformer(nn.Module):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
-    ) -> tuple | BaseModelOutputWithPooling:
+    ) -> tuple | Siglip2VisionOutput:
         r"""
         Returns:
         """
@@ -516,18 +535,25 @@ class Siglip2VisionTransformer(nn.Module):
             return_dict=return_dict,
         )
 
-        last_hidden_state = encoder_outputs[0]
+        if return_dict:
+            last_hidden_state = encoder_outputs.last_hidden_state
+            hidden_states_out = encoder_outputs.hidden_states
+            attentions = encoder_outputs.attentions
+        else:
+            last_hidden_state = encoder_outputs[0]
+            hidden_states_out = encoder_outputs[1] if len(encoder_outputs) > 1 else None
+            attentions = encoder_outputs[2] if len(encoder_outputs) > 2 else None
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
         pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
         if not return_dict:
             return (last_hidden_state, pooler_output) + encoder_outputs[1:]
 
-        return BaseModelOutputWithPooling(
+        return Siglip2VisionOutput(
             last_hidden_state=last_hidden_state,
             pooler_output=pooler_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
+            hidden_states=hidden_states_out,
+            attentions=attentions,
         )
 
 
