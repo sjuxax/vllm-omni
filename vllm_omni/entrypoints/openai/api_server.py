@@ -1300,6 +1300,8 @@ async def edit_images(
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string
+    # HunyuanImage-3.0 chain-of-thought reasoning.
+    bot_task: str | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
@@ -1381,6 +1383,8 @@ async def edit_images(
         # might produce blurry images in some environments.
         _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
         _update_if_not_none(gen_params, "generator_device", generator_device)
+        if bot_task is not None:
+            gen_params.extra_args["bot_task"] = bot_task
 
         # 4. Generate images using AsyncOmni (multi-stage mode)
         request_id = f"img_edit_{int(time.time())}"

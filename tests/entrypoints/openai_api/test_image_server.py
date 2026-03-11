@@ -684,6 +684,24 @@ def test_image_edit_parameter_pass(async_omni_test_client):
         assert data["size"] == "16x24"
 
 
+def test_image_edit_bot_task_forwarded(async_omni_test_client):
+    img_bytes = make_test_image_bytes((16, 16))
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img_bytes)],
+        data={
+            "prompt": "edit this image",
+            "bot_task": "think_recaption",
+        },
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured_sampling_params = engine.captured_sampling_params_list[-1]
+    assert captured_sampling_params.extra_args["bot_task"] == "think_recaption"
+
+
 def test_image_edit_parameter_default(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((24, 16))
 
