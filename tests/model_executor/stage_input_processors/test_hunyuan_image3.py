@@ -8,6 +8,8 @@ from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
     HUNYUAN_COT_SYSTEM_PROMPT_KEY,
     HUNYUAN_COT_TEXT_KEY,
     ar2diffusion,
+    extract_hunyuan_revised_prompt,
+    normalize_hunyuan_cot_text,
     wrap_hunyuan_stage0_prompt,
 )
 
@@ -54,3 +56,15 @@ def test_hunyuan_ar2diffusion_restores_original_prompt_and_attaches_cot_text():
     assert diffusion_prompt["additional_information"][HUNYUAN_COT_TEXT_KEY].startswith("<think>")
     assert diffusion_prompt["additional_information"][HUNYUAN_BOT_TASK_KEY] == "think_recaption"
     assert diffusion_prompt["additional_information"][HUNYUAN_COT_SYSTEM_PROMPT_KEY] is not None
+
+
+def test_normalize_hunyuan_cot_text_truncates_generation_spill():
+    noisy_output = (
+        "first pass</think><recaption>storm clouds over the city</recaption>"
+        "<|endoftext|><recaption>garbage tail</recaption>"
+    )
+
+    normalized = normalize_hunyuan_cot_text(noisy_output, "think_recaption")
+
+    assert normalized == "<think>first pass</think><recaption>storm clouds over the city</recaption>"
+    assert extract_hunyuan_revised_prompt(normalized) == "storm clouds over the city"

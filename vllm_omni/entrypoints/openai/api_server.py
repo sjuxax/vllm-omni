@@ -105,6 +105,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
+    extract_hunyuan_revised_prompt,
     is_hunyuan_cot_task,
     wrap_hunyuan_stage0_prompt,
 )
@@ -1606,9 +1607,9 @@ def _extract_revised_prompt(result: Any) -> str | None:
     if cot_text:
         # cot_text is a list (one per batch item); return the first.
         if isinstance(cot_text, list) and len(cot_text) > 0:
-            return cot_text[0]
+            return extract_hunyuan_revised_prompt(cot_text[0])
         if isinstance(cot_text, str):
-            return cot_text
+            return extract_hunyuan_revised_prompt(cot_text)
     return None
 
 

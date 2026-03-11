@@ -21,6 +21,10 @@ HUNYUAN_COT_SYSTEM_PROMPT_KEY = "hunyuan_cot_system_prompt"
 HUNYUAN_COT_TEXT_KEY = "hunyuan_cot_text"
 
 HUNYUAN_COT_TASKS = {"think", "recaption", "think_recaption"}
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+_RECAPTION_OPEN = "<recaption>"
+_RECAPTION_CLOSE = "</recaption>"
 
 
 def is_hunyuan_cot_task(bot_task: str | None) -> bool:
@@ -149,12 +153,73 @@ def ar2diffusion(
 
 
 def normalize_hunyuan_cot_text(generated_text: str, bot_task: str) -> str:
-    normalized = generated_text.lstrip()
-    if normalized.startswith("<think>") or normalized.startswith("<recaption>"):
-        return generated_text
+    sanitized = sanitize_hunyuan_cot_text(generated_text, bot_task)
+    if sanitized:
+        return sanitized
+
     if get_hunyuan_first_bot_task(bot_task) == "think":
-        return f"<think>{generated_text}"
-    return f"<recaption>{generated_text}"
+        return f"{_THINK_OPEN}{generated_text}"
+    return f"{_RECAPTION_OPEN}{generated_text}"
+
+
+def extract_hunyuan_revised_prompt(cot_text: str) -> str:
+    recaption_block = _extract_tag_block(cot_text, _RECAPTION_OPEN, _RECAPTION_CLOSE)
+    if recaption_block is not None:
+        return recaption_block[len(_RECAPTION_OPEN) : -len(_RECAPTION_CLOSE)].strip()
+
+    think_block = _extract_tag_block(cot_text, _THINK_OPEN, _THINK_CLOSE)
+    if think_block is not None:
+        return think_block[len(_THINK_OPEN) : -len(_THINK_CLOSE)].strip()
+
+    return cot_text.strip()
+
+
+def sanitize_hunyuan_cot_text(generated_text: str, bot_task: str) -> str:
+    text = generated_text.strip()
+    if not text:
+        return text
+
+    first_bot_task = get_hunyuan_first_bot_task(bot_task)
+    wants_recaption = "recaption" in bot_task
+
+    think_block = _extract_tag_block(
+        text if _THINK_OPEN in text else f"{_THINK_OPEN}{text}",
+        _THINK_OPEN,
+        _THINK_CLOSE,
+    ) if first_bot_task == "think" else None
+
+    recaption_source = text
+    if think_block is not None and _THINK_CLOSE in think_block:
+        think_close_idx = text.find(_THINK_CLOSE)
+        if think_close_idx != -1:
+            recaption_source = text[think_close_idx + len(_THINK_CLOSE) :]
+
+    recaption_block = _extract_tag_block(
+        recaption_source if _RECAPTION_OPEN in recaption_source else f"{_RECAPTION_OPEN}{recaption_source}",
+        _RECAPTION_OPEN,
+        _RECAPTION_CLOSE,
+    ) if wants_recaption or first_bot_task == "recaption" else None
+
+    if think_block is not None and recaption_block is not None:
+        return f"{think_block}{recaption_block}"
+    if think_block is not None:
+        return think_block
+    if recaption_block is not None:
+        return recaption_block
+
+    return text
+
+
+def _extract_tag_block(text: str, start_tag: str, end_tag: str) -> str | None:
+    start_idx = text.find(start_tag)
+    if start_idx == -1:
+        return None
+
+    end_idx = text.find(end_tag, start_idx + len(start_tag))
+    if end_idx == -1:
+        return text[start_idx:]
+
+    return text[start_idx : end_idx + len(end_tag)]
 
 
 def _count_input_images(multimodal: Mapping[str, Any]) -> int:
@@ -197,8 +262,10 @@ __all__ = [
     "HUNYUAN_COT_TEXT_KEY",
     "HUNYUAN_ORIGINAL_PROMPT_KEY",
     "ar2diffusion",
+    "extract_hunyuan_revised_prompt",
     "get_hunyuan_first_bot_task",
     "is_hunyuan_cot_task",
     "normalize_hunyuan_cot_text",
+    "sanitize_hunyuan_cot_text",
     "wrap_hunyuan_stage0_prompt",
 ]
