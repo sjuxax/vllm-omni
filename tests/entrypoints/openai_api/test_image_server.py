@@ -189,6 +189,28 @@ def async_omni_test_client():
     return TestClient(app)
 
 
+@pytest.fixture
+def hunyuan_async_omni_test_client():
+    """Create test client with mocked AsyncOmni engine for Hunyuan 2-stage routing."""
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    app.state.engine_client = FakeAsyncOmni()
+    app.state.stage_configs = [
+        {"stage_type": "llm", "engine_args": {"model_arch": "HunyuanImage3ForCausalMM"}},
+        {"stage_type": "diffusion"},
+    ]
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        max_generated_image_size=4096,
+    )
+    return TestClient(app)
+
+
 def test_health_endpoint(test_client):
     """Test health check endpoint for diffusion mode"""
     response = test_client.get("/health")
@@ -290,6 +312,30 @@ def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     assert captured[1].height == 256
     assert captured[1].width == 256
     assert captured[1].seed == 7
+
+
+def test_generate_images_async_omni_hunyuan_cot_routes_through_stage0(hunyuan_async_omni_test_client):
+    response = hunyuan_async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat wearing a raincoat",
+            "bot_task": "think_recaption",
+        },
+    )
+    assert response.status_code == 200
+
+    engine = hunyuan_async_omni_test_client.app.state.engine_client
+    captured_params = engine.captured_sampling_params_list
+    assert captured_params is not None
+    assert captured_params[0].stop == ["</recaption>"]
+    assert captured_params[0].include_stop_str_in_output is True
+    assert captured_params[1].extra_args["bot_task"] == "image"
+
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["prompt"].endswith("<think>")
+    metadata = captured_prompt["additional_information"]
+    assert metadata["hunyuan_bot_task"] == "think_recaption"
+    assert metadata["hunyuan_original_prompt"]["prompt"] == "a cat wearing a raincoat"
 
 
 def test_generate_multiple_images(test_client):

@@ -1,8 +1,5 @@
-# Stage config for running Hunyuan-Image3.0 with a staged AR -> diffusion flow.
-# Stage 0: AR model for CoT / recaption text generation
-# Stage 1: Diffusion pipeline for final image synthesis
-#
-# The stage-0 AR settings are kept aligned with the original 8433849 config.
+# Alias stage config for checkpoints whose `config.json` reports `model_type: "Hunyuan"`.
+# Keep this in sync with `hunyuan_image_3_moe.yaml`.
 
 stage_args:
   - stage_id: 0

@@ -24,6 +24,11 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
+    HUNYUAN_BOT_TASK_KEY,
+    HUNYUAN_COT_SYSTEM_PROMPT_KEY,
+    HUNYUAN_COT_TEXT_KEY,
+)
 
 from .autoencoder import AutoencoderKLConv3D
 from .hunyuan_image_3_tokenizer import TokenizerWrapper
@@ -1394,6 +1399,9 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
     ) -> DiffusionOutput:
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
         batch_cond_image_info: list[list[JointImageInfo]] | None = None
+        external_cot_text: list[str] | None = None
+        external_cot_system_prompt: str | None = None
+        external_bot_task: str | None = None
         if any(not isinstance(p, str) for p in req.prompts):
             batch_cond_image_info = []
             for p in req.prompts:
@@ -1407,6 +1415,15 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 if prompt_cond_infos is None:
                     prompt_cond_infos = []
                 batch_cond_image_info.append([_joint_image_info_from_payload(item) for item in prompt_cond_infos])
+                prompt_cot_text = prompt_additional_information.get(HUNYUAN_COT_TEXT_KEY)
+                if prompt_cot_text is not None:
+                    if external_cot_text is None:
+                        external_cot_text = []
+                    external_cot_text.append(prompt_cot_text)
+                    if external_bot_task is None:
+                        external_bot_task = prompt_additional_information.get(HUNYUAN_BOT_TASK_KEY)
+                    if external_cot_system_prompt is None:
+                        external_cot_system_prompt = prompt_additional_information.get(HUNYUAN_COT_SYSTEM_PROMPT_KEY)
             has_cond_image = [len(cond_infos) > 0 for cond_infos in batch_cond_image_info]
             if any(has_cond_image) and not all(has_cond_image):
                 raise ValueError(
@@ -1414,6 +1431,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 )
             if not any(has_cond_image):
                 batch_cond_image_info = None
+        if external_cot_text is not None and len(external_cot_text) != len(req.prompts):
+            raise ValueError("External Hunyuan CoT metadata must be present for every prompt in the batch.")
 
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
@@ -1428,10 +1447,18 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
 
         # Extract bot_task from request extra_args (default: "image" = no CoT)
         bot_task = req.sampling_params.extra_args.get("bot_task", "image")
+        if external_bot_task is not None:
+            bot_task = external_bot_task
 
         # ── Stage 1: Chain-of-thought text generation (optional) ──────────
-        cot_text = None
-        if bot_task in ("think", "recaption", "think_recaption"):
+        cot_text = external_cot_text
+        if cot_text is not None:
+            cot_system_prompt = external_cot_system_prompt or system_prompt
+            drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
+            if drop_think and system_prompt is None and cot_text[0].startswith("<recaption>"):
+                cot_system_prompt = get_system_prompt(sys_type="en_recaption", bot_task=bot_task)
+            system_prompt = cot_system_prompt
+        elif bot_task in ("think", "recaption", "think_recaption"):
             # Resolve system prompt for CoT mode
             cot_system_prompt = system_prompt
             if cot_system_prompt is None:
@@ -1448,7 +1475,11 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
                 batch_cond_image_info=batch_cond_image_info,
                 **kwargs,
             )
-            logger.info("Generated CoT text: %s", cot_text[0][:200] + "..." if len(cot_text[0]) > 200 else cot_text[0])
+            if get_tensor_model_parallel_rank() == 0:
+                logger.info(
+                    "Generated CoT text: %s",
+                    cot_text[0][:200] + "..." if len(cot_text[0]) > 200 else cot_text[0],
+                )
 
             # If drop_think stripped the <think> block, also switch system prompt
             # to the recaption variant for the image generation stage.

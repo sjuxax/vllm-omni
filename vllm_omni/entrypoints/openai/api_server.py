@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import base64
+import copy
 import io
 import json
 import multiprocessing
@@ -103,6 +104,10 @@ from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
+    is_hunyuan_cot_task,
+    wrap_hunyuan_stage0_prompt,
+)
 
 logger = init_logger(__name__)
 router = APIRouter()
@@ -1158,6 +1163,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             engine_client=engine_client,
             gen_params=gen_params,
             stage_types=stage_types,
+            stage_configs=getattr(raw_request.app.state, "stage_configs", None),
             prompt=prompt,
             request_id=request_id,
         )
@@ -1323,6 +1329,7 @@ async def edit_images(
             engine_client=engine_client,
             gen_params=gen_params,
             stage_types=stage_types,
+            stage_configs=getattr(raw_request.app.state, "stage_configs", None),
             prompt=prompt,
             request_id=request_id,
         )
@@ -1466,15 +1473,62 @@ def _parse_lora_request(lora_body: dict[str, Any]):
     return None, None
 
 
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _clone_sampling_params(params: OmniSamplingParams) -> OmniSamplingParams:
+    clone = getattr(params, "clone", None)
+    if callable(clone):
+        return clone()
+    return copy.deepcopy(params)
+
+
+def _is_hunyuan_two_stage_pipeline(stage_configs: list[Any] | None) -> bool:
+    if not isinstance(stage_configs, list) or len(stage_configs) < 2:
+        return False
+
+    stage0 = stage_configs[0]
+    if _cfg_get(stage0, "stage_type") != "llm":
+        return False
+
+    engine_args = _cfg_get(stage0, "engine_args")
+    return _cfg_get(engine_args, "model_arch") == "HunyuanImage3ForCausalMM"
+
+
+def _prepare_hunyuan_stage0_prompt(
+    prompt: Any,
+    gen_params: Any,
+    stage_configs: list[Any] | None,
+) -> tuple[Any, str | None]:
+    if not _is_hunyuan_two_stage_pipeline(stage_configs):
+        return prompt, None
+    if not isinstance(prompt, dict):
+        return prompt, None
+
+    extra_args = getattr(gen_params, "extra_args", {}) or {}
+    bot_task = extra_args.get("bot_task")
+    if not is_hunyuan_cot_task(bot_task):
+        return prompt, None
+
+    return wrap_hunyuan_stage0_prompt(prompt, bot_task), str(bot_task)
+
+
 async def _generate_with_async_omni(
     engine_client: AsyncOmni | Any,
     gen_params: Any,
     stage_types: list[str],
+    stage_configs: list[Any] | None = None,
     **kwargs,
 ):
     engine_client = cast(AsyncOmni, engine_client)
     result = None
     stage_list = getattr(engine_client, "stage_list", None)
+    prompt = kwargs.get("prompt")
+    prompt, hunyuan_bot_task = _prepare_hunyuan_stage0_prompt(prompt, gen_params, stage_configs)
+    kwargs["prompt"] = prompt
     if isinstance(stage_list, list):
         default_params_list: list[OmniSamplingParams] | None = getattr(
             engine_client, "default_sampling_params_list", None
@@ -1494,9 +1548,18 @@ async def _generate_with_async_omni(
         sampling_params_list: list[OmniSamplingParams] = []
         for idx, stage_type in enumerate(stage_types):
             if stage_type == "diffusion":
-                sampling_params_list.append(gen_params)
+                diffusion_params = _clone_sampling_params(gen_params)
+                if hunyuan_bot_task is not None:
+                    diffusion_params.extra_args = dict(diffusion_params.extra_args)
+                    diffusion_params.extra_args["bot_task"] = "image"
+                sampling_params_list.append(diffusion_params)
             else:
-                base_params = default_params_list[idx]
+                base_params = _clone_sampling_params(default_params_list[idx])
+                if hunyuan_bot_task is not None and idx == 0:
+                    stop_tag = "</recaption>" if "recaption" in hunyuan_bot_task else "</think>"
+                    base_params.stop = [stop_tag]
+                    base_params.include_stop_str_in_output = True
+                    base_params.detokenize = True
                 sampling_params_list.append(base_params)
 
         async for output in engine_client.generate(
