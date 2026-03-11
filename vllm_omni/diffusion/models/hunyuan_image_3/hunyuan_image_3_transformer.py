@@ -4,6 +4,8 @@
 import inspect
 import logging
 import math
+import os
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -65,6 +67,13 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = logging.getLogger(__name__)
+
+
+def _trace_hunyuan_forward_enabled() -> bool:
+    value = os.getenv("VLLM_OMNI_TRACE_HUNYUAN_FORWARD")
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -2410,11 +2419,21 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_rescale = guidance_rescale
 
         cfg_factor = 1 + self.do_classifier_free_guidance
+        trace_forward = _trace_hunyuan_forward_enabled()
+        trace_prefix = (
+            "Hunyuan forward"
+            f" batch={batch_size}"
+            f" image_size={tuple(image_size)}"
+            f" steps={num_inference_steps}"
+            f" guidance_scale={guidance_scale}"
+            f" cfg_factor={cfg_factor}"
+        )
 
         # Define call parameters
         device = self._execution_device
 
         # Prepare timesteps
+        timesteps_start = time.perf_counter()
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
@@ -2422,8 +2441,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             timesteps,
             sigmas,
         )
+        timesteps_elapsed = time.perf_counter() - timesteps_start
 
         # Prepare latent variables
+        latents_start = time.perf_counter()
         latents = self.prepare_latents(
             batch_size=batch_size,
             latent_channel=self.model.config.vae["latent_channels"],
@@ -2433,11 +2454,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             generator=generator,
             latents=latents,
         )
+        latents_elapsed = time.perf_counter() - latents_start
 
         # Prepare extra step kwargs.
         _scheduler_step_extra_kwargs = self.prepare_extra_func_kwargs(self.scheduler.step, {"generator": generator})
 
         # Prepare model kwargs
+        attention_start = time.perf_counter()
         input_ids = model_kwargs.pop("input_ids")
         attention_mask = self.model._prepare_attention_mask_for_generation(  # noqa
             input_ids,
@@ -2450,6 +2473,17 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
         model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+        attention_elapsed = time.perf_counter() - attention_start
+        logger.info(
+            "%s setup: timesteps=%.3fs latents=%.3fs attention=%.3fs input_ids=%s attention_mask=%s latents=%s",
+            trace_prefix,
+            timesteps_elapsed,
+            latents_elapsed,
+            attention_elapsed,
+            tuple(input_ids.shape),
+            tuple(model_kwargs["attention_mask"].shape),
+            tuple(latents.shape),
+        )
 
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -2457,33 +2491,75 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                step_start = time.perf_counter()
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * cfg_factor)
                 # latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                expand_elapsed = time.perf_counter() - step_start
 
                 t_expand = t.repeat(latent_model_input.shape[0])
 
+                prepare_inputs_start = time.perf_counter()
                 model_inputs = self.model.prepare_inputs_for_generation(
                     input_ids,
                     images=latent_model_input,
                     timestep=t_expand,
                     **model_kwargs,
                 )
+                prepare_inputs_elapsed = time.perf_counter() - prepare_inputs_start
+                if trace_forward:
+                    logger.info(
+                        "%s step=%d/%d prepared inputs in %.3fs latent_model_input=%s timestep=%s",
+                        trace_prefix,
+                        i + 1,
+                        len(timesteps),
+                        prepare_inputs_elapsed,
+                        tuple(latent_model_input.shape),
+                        tuple(t_expand.shape),
+                    )
 
+                model_forward_start = time.perf_counter()
                 with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                     model_output = self.model.forward(**model_inputs, first_step=(i == 0))
                     pred = model_output["diffusion_prediction"]
+                model_forward_elapsed = time.perf_counter() - model_forward_start
                 pred = pred.to(dtype=torch.float32)
+                if trace_forward:
+                    logger.info(
+                        "%s step=%d/%d model forward completed in %.3fs pred=%s",
+                        trace_prefix,
+                        i + 1,
+                        len(timesteps),
+                        model_forward_elapsed,
+                        tuple(pred.shape),
+                    )
 
                 # perform guidance
+                guidance_start = time.perf_counter()
                 if self.do_classifier_free_guidance:
                     pred_cond, pred_uncond = pred.chunk(2)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
+                guidance_elapsed = time.perf_counter() - guidance_start
 
                 # compute the previous noisy sample x_t -> x_t-1
+                scheduler_start = time.perf_counter()
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
+                scheduler_elapsed = time.perf_counter() - scheduler_start
+                logger.info(
+                    "%s step=%d/%d timings: expand=%.3fs prepare_inputs=%.3fs model_forward=%.3fs guidance=%.3fs scheduler=%.3fs total=%.3fs",
+                    trace_prefix,
+                    i + 1,
+                    len(timesteps),
+                    expand_elapsed,
+                    prepare_inputs_elapsed,
+                    model_forward_elapsed,
+                    guidance_elapsed,
+                    scheduler_elapsed,
+                    time.perf_counter() - step_start,
+                )
 
                 if i != len(timesteps) - 1:
+                    update_kwargs_start = time.perf_counter()
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
                         model_kwargs,
@@ -2496,6 +2572,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     seq_lens = [seq_len] * b
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
+                    if trace_forward:
+                        logger.info(
+                            "%s step=%d/%d updated model kwargs in %.3fs next_attention_mask=%s",
+                            trace_prefix,
+                            i + 1,
+                            len(timesteps),
+                            time.perf_counter() - update_kwargs_start,
+                            tuple(attention_mask.shape),
+                        )
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -2517,8 +2602,16 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if hasattr(self.vae, "ffactor_temporal"):
             latents = latents.unsqueeze(2)
 
+        decode_start = time.perf_counter()
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
             image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        logger.info(
+            "%s decode completed in %.3fs latents=%s image=%s",
+            trace_prefix,
+            time.perf_counter() - decode_start,
+            tuple(latents.shape),
+            tuple(image.shape),
+        )
 
         if hasattr(self.vae, "ffactor_temporal"):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"

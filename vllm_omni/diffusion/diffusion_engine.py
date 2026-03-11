@@ -23,6 +23,13 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def supports_image_input(model_class_name: str) -> bool:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:
@@ -59,12 +66,24 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
 
+        if self._should_skip_dummy_run():
+            logger.info(
+                "Skipping diffusion dummy run for model %s.",
+                od_config.model_class_name,
+            )
+            return
+
         try:
             self._dummy_run()
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()
             raise e
+
+    def _should_skip_dummy_run(self) -> bool:
+        if _env_flag("VLLM_OMNI_SKIP_DIFFUSION_DUMMY_RUN", default=False):
+            return True
+        return self.od_config.model_class_name == "HunyuanImage3ForCausalMM"
 
     def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
         diffusion_engine_start_time = time.perf_counter()
