@@ -55,6 +55,19 @@ BatchRaggedImages = torch.Tensor | list[torch.Tensor | list[torch.Tensor]]
 BatchRaggedTensor = torch.Tensor | list[torch.Tensor]
 
 
+def _is_dummy_warmup_request(req: OmniDiffusionRequest, prompt_texts: list[str] | None = None) -> bool:
+    if getattr(req, "request_ids", None):
+        return False
+    if req.sampling_params.num_inference_steps != 1:
+        return False
+    if prompt_texts is None:
+        prompt_texts = [
+            p if isinstance(p, str) else (p.get("prompt") or "")
+            for p in req.prompts
+        ]
+    return len(prompt_texts) == 1 and prompt_texts[0] == "dummy run"
+
+
 def default(val, d):
     return val if val is not None else d
 
@@ -261,6 +274,7 @@ def get_hunyuan_image_3_pre_process_func(
         )
 
     def pre_process_func(request: OmniDiffusionRequest):
+        is_dummy_warmup = _is_dummy_warmup_request(request)
         for i, prompt in enumerate(request.prompts):
             if isinstance(prompt, str):
                 prompt = OmniTextPrompt(prompt=prompt)
@@ -271,7 +285,11 @@ def get_hunyuan_image_3_pre_process_func(
             multi_modal_data = prompt.get("multi_modal_data") or {}
             raw_images = multi_modal_data.get("image")
             has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
-            if has_images:
+            # DiffusionEngine warmup uses a synthetic image for every pipeline
+            # that advertises image input. For staged Hunyuan, routing that
+            # through edit-mode validation is unnecessarily expensive and can
+            # stall startup. Keep warmup on the plain t2i path instead.
+            if has_images and not is_dummy_warmup:
                 image_list = raw_images if isinstance(raw_images, list) else [raw_images]
                 cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
                 prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
@@ -1398,6 +1416,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         **kwargs,
     ) -> DiffusionOutput:
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        is_dummy_warmup = _is_dummy_warmup_request(req, prompt)
         batch_cond_image_info: list[list[JointImageInfo]] | None = None
         external_cot_text: list[str] | None = None
         external_cot_system_prompt: str | None = None
@@ -1440,9 +1459,12 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
-        if guidance_scale <= 1.0:
+        if guidance_scale <= 1.0 and not is_dummy_warmup:
             logger.warning("HunyuanImage3.0 does not support guidance_scale <= 1.0, will set it to 1.0 + epsilon.")
             guidance_scale = 1.0 + np.finfo(float).eps
+        elif is_dummy_warmup and guidance_scale <= 1.0:
+            # Keep warmup on a minimal single-branch path.
+            guidance_scale = 1.0
         image_size = (height, width)
 
         # Extract bot_task from request extra_args (default: "image" = no CoT)
