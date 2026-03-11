@@ -327,7 +327,7 @@ def test_generate_images_async_omni_hunyuan_cot_routes_through_stage0(hunyuan_as
     engine = hunyuan_async_omni_test_client.app.state.engine_client
     captured_params = engine.captured_sampling_params_list
     assert captured_params is not None
-    assert captured_params[0].stop == ["</recaption>"]
+    assert captured_params[0].stop == ["</recaption>", "</answer>", "<|endoftext|>"]
     assert captured_params[0].include_stop_str_in_output is True
     assert captured_params[1].extra_args["bot_task"] == "image"
 

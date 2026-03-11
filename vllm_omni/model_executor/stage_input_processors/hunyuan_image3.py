@@ -198,6 +198,7 @@ def sanitize_hunyuan_cot_text(generated_text: str, bot_task: str) -> str:
         recaption_source if _RECAPTION_OPEN in recaption_source else f"{_RECAPTION_OPEN}{recaption_source}",
         _RECAPTION_OPEN,
         _RECAPTION_CLOSE,
+        fallback_end_tags=("</answer>", "<|endoftext|>"),
     ) if wants_recaption or first_bot_task == "recaption" else None
 
     if think_block is not None and recaption_block is not None:
@@ -210,16 +211,31 @@ def sanitize_hunyuan_cot_text(generated_text: str, bot_task: str) -> str:
     return text
 
 
-def _extract_tag_block(text: str, start_tag: str, end_tag: str) -> str | None:
+def _extract_tag_block(
+    text: str,
+    start_tag: str,
+    end_tag: str,
+    *,
+    fallback_end_tags: tuple[str, ...] = (),
+) -> str | None:
     start_idx = text.find(start_tag)
     if start_idx == -1:
         return None
 
     end_idx = text.find(end_tag, start_idx + len(start_tag))
+    closing_tag = end_tag
     if end_idx == -1:
-        return text[start_idx:]
+        fallback_candidates = [
+            text.find(tag, start_idx + len(start_tag))
+            for tag in fallback_end_tags
+            if text.find(tag, start_idx + len(start_tag)) != -1
+        ]
+        if fallback_candidates:
+            end_idx = min(fallback_candidates)
+        else:
+            return text[start_idx:]
 
-    return text[start_idx : end_idx + len(end_tag)]
+    return text[start_idx:end_idx] + closing_tag
 
 
 def _count_input_images(multimodal: Mapping[str, Any]) -> int:

@@ -106,6 +106,7 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
     extract_hunyuan_revised_prompt,
+    get_hunyuan_first_bot_task,
     is_hunyuan_cot_task,
     wrap_hunyuan_stage0_prompt,
 )
@@ -1557,8 +1558,13 @@ async def _generate_with_async_omni(
             else:
                 base_params = _clone_sampling_params(default_params_list[idx])
                 if hunyuan_bot_task is not None and idx == 0:
-                    stop_tag = "</recaption>" if "recaption" in hunyuan_bot_task else "</think>"
-                    base_params.stop = [stop_tag]
+                    first_bot_task = get_hunyuan_first_bot_task(hunyuan_bot_task)
+                    stop_strings = ["</answer>", "<|endoftext|>"]
+                    if "recaption" in hunyuan_bot_task:
+                        stop_strings.insert(0, "</recaption>")
+                    elif first_bot_task == "think":
+                        stop_strings.insert(0, "</think>")
+                    base_params.stop = stop_strings
                     base_params.include_stop_str_in_output = True
                     base_params.detokenize = True
                 sampling_params_list.append(base_params)

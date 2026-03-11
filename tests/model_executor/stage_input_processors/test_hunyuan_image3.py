@@ -68,3 +68,12 @@ def test_normalize_hunyuan_cot_text_truncates_generation_spill():
 
     assert normalized == "<think>first pass</think><recaption>storm clouds over the city</recaption>"
     assert extract_hunyuan_revised_prompt(normalized) == "storm clouds over the city"
+
+
+def test_normalize_hunyuan_cot_text_accepts_answer_close_as_recaption_end():
+    noisy_output = "drafting</think><recaption>storm clouds over the city</answer><|endoftext|>"
+
+    normalized = normalize_hunyuan_cot_text(noisy_output, "think_recaption")
+
+    assert normalized == "<think>drafting</think><recaption>storm clouds over the city</recaption>"
+    assert extract_hunyuan_revised_prompt(normalized) == "storm clouds over the city"
