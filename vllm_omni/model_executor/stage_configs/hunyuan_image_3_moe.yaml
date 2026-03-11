@@ -23,6 +23,9 @@ stage_args:
       engine_output_type: text
       distributed_executor_backend: "mp"
       enable_prefix_caching: true
+      # Stage-0 AR startup otherwise profiles the multimodal encoder path
+      # before sending READY, which can stall Hunyuan startup for minutes.
+      skip_mm_profiling: true
       max_num_batched_tokens: 16384
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
