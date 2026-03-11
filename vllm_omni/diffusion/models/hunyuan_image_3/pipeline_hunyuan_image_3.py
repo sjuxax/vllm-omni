@@ -311,10 +311,14 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
     support_image_input = True
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
-        self.hf_config = get_config(od_config.model, trust_remote_code=True)
+        self.hf_config = get_config(od_config.model, trust_remote_code=od_config.trust_remote_code)
         super().__init__(self.hf_config)
         # update diffusion config
-        self.generation_config = GenerationConfig.from_pretrained(od_config.model)
+        self.generation_config = GenerationConfig.from_pretrained(
+            od_config.model,
+            trust_remote_code=od_config.trust_remote_code,
+            revision=od_config.revision or "main",
+        )
         self.od_config = od_config
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -328,7 +332,11 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin):
         self.model = HunyuanImage3Model(self.hf_config)
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
         self._pipeline = None
-        self._tkwrapper = TokenizerWrapper(od_config.model)
+        self._tkwrapper = TokenizerWrapper(
+            od_config.model,
+            trust_remote_code=od_config.trust_remote_code,
+            revision=od_config.revision,
+        )
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.hf_config.vit.pop("use_return_dict", None)
         vision_config = Siglip2VisionConfig(**self.hf_config.vit)
