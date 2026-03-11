@@ -59,8 +59,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "revised_prompt")
     FUNCTION = "generate"
 
     async def generate(
@@ -98,7 +98,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             if audio is None and image is None and video is None:
                 # No multimodal input --- use DALL-E image generation
                 logger.info("Using DALL-E image generation endpoint")
-                output = await client.generate_image(
+                output, revised_prompt = await client.generate_image(
                     model=model,
                     prompt=prompt,
                     width=width,
@@ -106,11 +106,11 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     negative_prompt=negative_prompt,
                     sampling_params=sampling_params,
                 )
-                return (output,)
+                return (output, revised_prompt)
             elif image is not None and audio is None and video is None:
                 # Image and text input --- use DALL-E image edit
                 logger.info("Using DALL-E image edit endpoint")
-                output = await client.edit_image(
+                output, revised_prompt = await client.edit_image(
                     model=model,
                     prompt=prompt,
                     image=image,
@@ -120,7 +120,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     mask=mask,
                     sampling_params=sampling_params,
                 )
-                return (output,)
+                return (output, revised_prompt)
 
         logger.info("Using chat completion endpoint")
         sampling_params = add_sampling_parameters_to_stage(
@@ -138,7 +138,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             sampling_params=sampling_params,
         )
 
-        return (output,)
+        # Chat completion endpoint doesn't return revised_prompt
+        return (output, "")
 
 
 class VLLMOmniUnderstanding(_VLLMOmniGenerateBase):
@@ -487,6 +488,19 @@ class VLLMOmniDiffusionSampling:
                         "tooltip": "Enable VAE tiling for reduced memory usage (slight quality trade-off)",
                     },
                 ),
+                "bot_task": (
+                    ["disabled", "think_recaption", "recaption", "think", "image"],
+                    {
+                        "default": "disabled",
+                        "tooltip": (
+                            "CoT reasoning mode for HunyuanImage-3.0-Instruct. "
+                            "'think_recaption' thinks then recaptions before diffusion, "
+                            "'recaption' recaptions only, 'think' thinks only, "
+                            "'image' generates directly without CoT. "
+                            "Ignored by models that do not support it."
+                        ),
+                    },
+                ),
                 # === Put seed at last. ===
                 # Whenever a field named "seed" is present, ComfyUI adds another field called "control after generate"
                 "seed": (
@@ -506,10 +520,12 @@ class VLLMOmniDiffusionSampling:
     FUNCTION = "get_params"
     CATEGORY = "vLLM-Omni/Sampling Params"
 
-    def get_params(self, seed, **kwargs):
+    def get_params(self, seed, bot_task="disabled", **kwargs):
         params = DiffusionSamplingParams(kwargs)
         if seed >= 0:
             params["seed"] = seed
+        if bot_task != "disabled":
+            params["bot_task"] = bot_task
         return (params,)
 
 

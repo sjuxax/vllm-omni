@@ -43,8 +43,12 @@ class VLLMOmniClient:
         height: int,
         negative_prompt: str | None = None,
         sampling_params: dict | None = None,
-    ) -> torch.Tensor:
-        """Run text-to-image generation via DALLE API"""
+    ) -> tuple[torch.Tensor, str]:
+        """Run text-to-image generation via DALLE API.
+
+        Returns (image_tensor, revised_prompt) where revised_prompt is the
+        CoT-revised prompt returned by the server (empty string if absent).
+        """
         await self._check_model_exist(model)
 
         size = f"{width}x{height}"
@@ -84,6 +88,7 @@ class VLLMOmniClient:
                         raise RuntimeError("API returned empty data array")
 
                     image_tensors = []
+                    revised_prompts = []
                     for idx, img in enumerate(data["data"]):
                         if "b64_json" not in img:
                             raise RuntimeError(f"API returned image #{idx} without 'b64_json' field")
@@ -91,10 +96,13 @@ class VLLMOmniClient:
                         tensor = base64_to_image_tensor(base64_str)
                         image_tensors.append(tensor)
                         logger.debug("Image #%d has shape %s", idx, tensor.shape)
+                        if img.get("revised_prompt"):
+                            revised_prompts.append(img["revised_prompt"])
 
                     batch_tensor = torch.stack(image_tensors, dim=0)
                     logger.debug("batch_tensor output has shape: %s", batch_tensor.shape)
-                    return batch_tensor
+                    revised_prompt = "\n\n".join(revised_prompts)
+                    return batch_tensor, revised_prompt
 
             except aiohttp.ClientError as e:
                 raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
@@ -110,8 +118,12 @@ class VLLMOmniClient:
         negative_prompt: str | None = None,
         mask: torch.Tensor | None = None,
         sampling_params: dict | None = None,
-    ) -> torch.Tensor:
-        """Run image editing via DALLE API"""
+    ) -> tuple[torch.Tensor, str]:
+        """Run image editing via DALLE API.
+
+        Returns (image_tensor, revised_prompt) where revised_prompt is the
+        CoT-revised prompt returned by the server (empty string if absent).
+        """
         await self._check_model_exist(model)
 
         size = f"{width}x{height}"
@@ -161,14 +173,18 @@ class VLLMOmniClient:
                         raise RuntimeError("API returned empty data array")
 
                     image_tensors = []
+                    revised_prompts = []
                     for idx, img in enumerate(data["data"]):
                         if "b64_json" not in img:
                             raise RuntimeError(f"API returned image #{idx} without 'b64_json' field")
                         base64_str = img["b64_json"]
                         tensor = base64_to_image_tensor(base64_str)
                         image_tensors.append(tensor)
+                        if img.get("revised_prompt"):
+                            revised_prompts.append(img["revised_prompt"])
 
-                    return torch.stack(image_tensors, dim=0)
+                    revised_prompt = "\n\n".join(revised_prompts)
+                    return torch.stack(image_tensors, dim=0), revised_prompt
 
             except aiohttp.ClientError as e:
                 raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
