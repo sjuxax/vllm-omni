@@ -6,7 +6,7 @@ stage_args:
     stage_type: llm
     runtime:
       process: true
-      devices: "0,1,2,3,4,5,6,7"
+      devices: "0,1,2,3"
       max_batch_size: 1
       requires_multimodal_data: true
     engine_args:
@@ -14,14 +14,14 @@ stage_args:
       model_arch: HunyuanImage3ForCausalMM
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
       distributed_executor_backend: "mp"
       enable_prefix_caching: true
-      max_num_batched_tokens: 32768
-      tensor_parallel_size: 8
+      max_num_batched_tokens: 16384
+      tensor_parallel_size: 4
       pipeline_parallel_size: 1
     is_comprehension: true
     final_output: false
@@ -38,21 +38,26 @@ stage_args:
     stage_type: diffusion
     runtime:
       process: true
-      devices: "0,1,2,3,4,5,6,7"
+      devices: "4,5,6,7"
       max_batch_size: 1
       requires_multimodal_data: true
     engine_args:
       model_stage: dit
       model_arch: HunyuanImage3ForCausalMM
-      gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: image
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
-      max_num_batched_tokens: 32768
-      tensor_parallel_size: 8
-      pipeline_parallel_size: 1
+      # Diffusion stages only honor distributed settings when they are nested
+      # under `parallel_config`; top-level TP keys are ignored.
+      parallel_config:
+        tensor_parallel_size: 4
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        enable_expert_parallel: true
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion
     final_output: true
