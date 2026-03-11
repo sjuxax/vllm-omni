@@ -112,6 +112,7 @@ from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
     get_hunyuan_first_bot_task,
     is_hunyuan_cot_task,
     normalize_hunyuan_cot_text,
+    resolve_hunyuan_stop_token_ids,
     wrap_hunyuan_stage0_prompt,
 )
 
@@ -1552,6 +1553,32 @@ def _extract_stage_text_output(result: Any) -> str:
     return getattr(outputs[0], "text", "") or ""
 
 
+# Lazily resolved Hunyuan stop-token IDs.  Populated on first use by
+# ``_get_hunyuan_stop_token_ids`` so we don't need the tokenizer at
+# import time.
+_hunyuan_stop_ids: dict[str, list[int]] | None = None
+
+
+async def _get_hunyuan_stop_token_ids(
+    engine_client: AsyncOmni,
+    phase: str,
+) -> list[int]:
+    """Return cached stop-token IDs for the given CoT *phase*."""
+    global _hunyuan_stop_ids
+    if _hunyuan_stop_ids is None:
+        tokenizer = await engine_client.get_tokenizer()
+        _hunyuan_stop_ids = {
+            "think": resolve_hunyuan_stop_token_ids(tokenizer, "think"),
+            "recaption": resolve_hunyuan_stop_token_ids(tokenizer, "recaption"),
+        }
+        logger.info(
+            "Resolved Hunyuan stop-token IDs: think=%s, recaption=%s",
+            _hunyuan_stop_ids["think"],
+            _hunyuan_stop_ids["recaption"],
+        )
+    return _hunyuan_stop_ids[phase]
+
+
 async def _generate_hunyuan_two_pass_stage0(
     engine_client: AsyncOmni,
     prompt: OmniTextPrompt,
@@ -1566,7 +1593,7 @@ async def _generate_hunyuan_two_pass_stage0(
 
     think_prompt = wrap_hunyuan_stage0_prompt(prompt, "think")
     think_params = _clone_sampling_params(stage0_params)
-    think_params.stop = ["</think>", "</answer>", "<|endoftext|>"]
+    think_params.stop_token_ids = await _get_hunyuan_stop_token_ids(engine_client, "think")
     think_result = await engine_client.generate_stage(
         stage_id=0,
         prompt=think_prompt,
@@ -1577,7 +1604,7 @@ async def _generate_hunyuan_two_pass_stage0(
 
     recaption_prompt = build_hunyuan_stage0_followup_prompt(prompt, "think_recaption", think_text)
     recaption_params = _clone_sampling_params(stage0_params)
-    recaption_params.stop = ["</recaption>", "</answer>", "<|endoftext|>"]
+    recaption_params.stop_token_ids = await _get_hunyuan_stop_token_ids(engine_client, "recaption")
     recaption_result = await engine_client.generate_stage(
         stage_id=0,
         prompt=recaption_prompt,
@@ -1620,19 +1647,37 @@ async def _generate_with_async_omni(
     result = None
     stage_list = getattr(engine_client, "stage_list", None)
     prompt = kwargs.get("prompt")
+
+    # ── Hunyuan two-stage pipeline: route via generate_stage ──────────
     if (
         _is_hunyuan_two_stage_pipeline(stage_configs)
         and isinstance(prompt, dict)
-        and (getattr(gen_params, "extra_args", {}) or {}).get("bot_task") == "think_recaption"
         and hasattr(engine_client, "generate_stage")
     ):
-        return await _generate_hunyuan_two_pass_stage0(
-            engine_client=engine_client,
+        bot_task = (getattr(gen_params, "extra_args", {}) or {}).get("bot_task")
+
+        if bot_task == "think_recaption":
+            return await _generate_hunyuan_two_pass_stage0(
+                engine_client=engine_client,
+                prompt=prompt,
+                request_id=kwargs["request_id"],
+                gen_params=gen_params,
+                stage_types=stage_types,
+            )
+
+        # Non-CoT (bot_task is None, "image", or any non-CoT value):
+        # skip stage-0 AR entirely and send straight to diffusion.
+        diffusion_params = _clone_sampling_params(gen_params)
+        diffusion_params.extra_args = dict(diffusion_params.extra_args)
+        if not diffusion_params.extra_args.get("bot_task"):
+            diffusion_params.extra_args["bot_task"] = "image"
+        return await engine_client.generate_stage(
+            stage_id=1,
             prompt=prompt,
             request_id=kwargs["request_id"],
-            gen_params=gen_params,
-            stage_types=stage_types,
+            sampling_params=diffusion_params,
         )
+
     prompt, hunyuan_bot_task = _prepare_hunyuan_stage0_prompt(prompt, gen_params, stage_configs)
     kwargs["prompt"] = prompt
     if isinstance(stage_list, list):
@@ -1658,6 +1703,14 @@ async def _generate_with_async_omni(
                     base_params.stop = stop_strings
                     base_params.include_stop_str_in_output = True
                     base_params.detokenize = True
+                    # Also set token-ID stops as defense in depth;
+                    # string matching can miss multi-token specials.
+                    try:
+                        phase = "recaption" if "recaption" in hunyuan_bot_task else first_bot_task
+                        tokenizer = await engine_client.get_tokenizer()
+                        base_params.stop_token_ids = resolve_hunyuan_stop_token_ids(tokenizer, phase)
+                    except Exception:
+                        pass  # Fall back to string stops only
                 sampling_params_list.append(base_params)
 
         async for output in engine_client.generate(

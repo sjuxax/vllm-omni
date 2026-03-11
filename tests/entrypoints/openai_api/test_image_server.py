@@ -10,6 +10,7 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 import base64
 import io
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -152,6 +153,16 @@ class FakeAsyncOmni:
         result = MockGenerationResult([Image.new("RGB", (64, 64), color="green")])
         result.custom_output = {}
         return result
+
+    async def get_tokenizer(self):
+        tok = type("FakeTok", (), {
+            "convert_tokens_to_ids": lambda self, t: {
+                "</think>": 100, "</recaption>": 101,
+                "</answer>": 102, "<boi>": 103,
+            }.get(t),
+            "eos_token_id": 104,
+        })()
+        return tok
 
 
 @pytest.fixture
@@ -356,11 +367,13 @@ def test_generate_images_async_omni_hunyuan_cot_routes_through_stage0(hunyuan_as
 
     think_call, recaption_call, diffusion_call = engine.stage_calls
     assert think_call["stage_id"] == 0
-    assert think_call["sampling_params"].stop == ["</think>", "</answer>", "<|endoftext|>"]
+    assert think_call["sampling_params"].stop_token_ids
+    assert think_call["sampling_params"].stop is None or think_call["sampling_params"].stop == []
     assert think_call["prompt"]["prompt"].endswith("<think>")
 
     assert recaption_call["stage_id"] == 0
-    assert recaption_call["sampling_params"].stop == ["</recaption>", "</answer>", "<|endoftext|>"]
+    assert recaption_call["sampling_params"].stop_token_ids
+    assert recaption_call["sampling_params"].stop is None or recaption_call["sampling_params"].stop == []
     assert recaption_call["prompt"]["prompt"].endswith("<recaption>")
     assert "</think><recaption>" in recaption_call["prompt"]["prompt"]
 
@@ -375,6 +388,39 @@ def test_generate_images_async_omni_hunyuan_cot_routes_through_stage0(hunyuan_as
 
     data = response.json()
     assert data["data"][0]["revised_prompt"] == "storm clouds over the city"
+
+
+def test_hunyuan_non_cot_bypasses_stage0(hunyuan_async_omni_test_client):
+    """Non-CoT Hunyuan requests should skip stage-0 AR entirely."""
+    response = hunyuan_async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a sunset over mountains",
+        },
+    )
+    assert response.status_code == 200
+
+    engine = hunyuan_async_omni_test_client.app.state.engine_client
+    # Should go directly to stage-1 diffusion, never touching stage-0
+    assert len(engine.stage_calls) == 1
+    assert engine.stage_calls[0]["stage_id"] == 1
+    assert engine.stage_calls[0]["sampling_params"].extra_args.get("bot_task") == "image"
+
+
+def test_hunyuan_explicit_image_bot_task_bypasses_stage0(hunyuan_async_omni_test_client):
+    """Explicit bot_task='image' should also skip stage-0."""
+    response = hunyuan_async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a sunset over mountains",
+            "bot_task": "image",
+        },
+    )
+    assert response.status_code == 200
+
+    engine = hunyuan_async_omni_test_client.app.state.engine_client
+    assert len(engine.stage_calls) == 1
+    assert engine.stage_calls[0]["stage_id"] == 1
 
 
 def test_generate_multiple_images(test_client):

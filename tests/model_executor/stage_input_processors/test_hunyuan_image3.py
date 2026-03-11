@@ -3,6 +3,8 @@
 
 from types import SimpleNamespace
 
+from unittest.mock import MagicMock
+
 from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
     HUNYUAN_BOT_TASK_KEY,
     HUNYUAN_COT_SYSTEM_PROMPT_KEY,
@@ -11,6 +13,7 @@ from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
     build_hunyuan_stage0_followup_prompt,
     extract_hunyuan_revised_prompt,
     normalize_hunyuan_cot_text,
+    resolve_hunyuan_stop_token_ids,
     wrap_hunyuan_stage0_prompt,
 )
 
@@ -93,3 +96,42 @@ def test_build_hunyuan_stage0_followup_prompt_appends_recaption_stage():
     assert wrapped["prompt"].endswith("<recaption>")
     assert "</think><recaption>" in wrapped["prompt"]
     assert wrapped["additional_information"][HUNYUAN_BOT_TASK_KEY] == "think_recaption"
+
+
+def _make_fake_tokenizer(token_map: dict[str, int]):
+    tok = MagicMock()
+    tok.convert_tokens_to_ids = lambda t: token_map.get(t)
+    tok.eos_token_id = token_map.get("<|endoftext|>", 0)
+    return tok
+
+
+def test_resolve_hunyuan_stop_token_ids_think():
+    tok = _make_fake_tokenizer({
+        "</think>": 100,
+        "</answer>": 101,
+        "<boi>": 102,
+        "<|endoftext|>": 103,
+        "</recaption>": 104,
+    })
+    ids = resolve_hunyuan_stop_token_ids(tok, "think")
+    assert 100 in ids  # </think>
+    assert 101 in ids  # </answer>
+    assert 102 in ids  # <boi>
+    assert 103 in ids  # eos
+    assert 104 not in ids  # </recaption> NOT included for think
+
+
+def test_resolve_hunyuan_stop_token_ids_recaption():
+    tok = _make_fake_tokenizer({
+        "</think>": 100,
+        "</answer>": 101,
+        "<boi>": 102,
+        "<|endoftext|>": 103,
+        "</recaption>": 104,
+    })
+    ids = resolve_hunyuan_stop_token_ids(tok, "recaption")
+    assert 104 in ids  # </recaption>
+    assert 101 in ids  # </answer>
+    assert 102 in ids  # <boi>
+    assert 103 in ids  # eos
+    assert 100 not in ids  # </think> NOT included for recaption

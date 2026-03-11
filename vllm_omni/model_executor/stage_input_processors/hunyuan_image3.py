@@ -356,6 +356,39 @@ def _prompt_to_dict(prompt: Mapping[str, Any] | str | None) -> dict[str, Any]:
     return {"prompt": prompt}
 
 
+def resolve_hunyuan_stop_token_ids(
+    tokenizer: Any,
+    phase: str,
+) -> list[int]:
+    """Resolve stop token IDs for a Hunyuan CoT generation phase.
+
+    Args:
+        tokenizer: HuggingFace tokenizer with ``convert_tokens_to_ids``.
+        phase: ``"think"`` or ``"recaption"``.
+
+    Returns:
+        List of token IDs that should halt generation.  Always includes
+        ``<boi>`` (prevents the model from entering image-generation mode)
+        and the EOS token.
+    """
+    convert = tokenizer.convert_tokens_to_ids
+    # <boi> must always stop generation -- the AR model must never enter
+    # image-generation mode during CoT text production.
+    ids: list[int] = []
+    if phase == "think":
+        ids.append(convert("</think>"))
+    else:
+        ids.append(convert("</recaption>"))
+    ids.append(convert("</answer>"))
+    ids.append(convert("<boi>"))
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        ids.append(eos)
+    # Deduplicate while preserving order
+    seen: set[int] = set()
+    return [i for i in ids if i is not None and not (i in seen or seen.add(i))]
+
+
 __all__ = [
     "HUNYUAN_BOT_TASK_KEY",
     "HUNYUAN_COT_SYSTEM_PROMPT_KEY",
@@ -369,6 +402,7 @@ __all__ = [
     "get_hunyuan_first_bot_task",
     "is_hunyuan_cot_task",
     "normalize_hunyuan_cot_text",
+    "resolve_hunyuan_stop_token_ids",
     "sanitize_hunyuan_cot_text",
     "wrap_hunyuan_stage0_prompt",
 ]
