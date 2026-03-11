@@ -119,12 +119,39 @@ class FakeAsyncOmni:
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
+        self.stage_calls = []
 
     async def generate(self, prompt, request_id, sampling_params_list):
         self.captured_sampling_params_list = sampling_params_list
         self.captured_prompt = prompt
         images = [Image.new("RGB", (64, 64), color="green")]
         yield MockGenerationResult(images)
+
+    async def generate_stage(self, stage_id, prompt, request_id, sampling_params):
+        self.stage_calls.append(
+            {
+                "stage_id": stage_id,
+                "prompt": prompt,
+                "request_id": request_id,
+                "sampling_params": sampling_params,
+            }
+        )
+        if stage_id == 0:
+            if prompt["prompt"].endswith("<think>"):
+                return SimpleNamespace(
+                    request_id=request_id,
+                    finished=True,
+                    outputs=[SimpleNamespace(text="reason about the image</think>")],
+                )
+            return SimpleNamespace(
+                request_id=request_id,
+                finished=True,
+                outputs=[SimpleNamespace(text="storm clouds over the city</recaption>")],
+            )
+
+        result = MockGenerationResult([Image.new("RGB", (64, 64), color="green")])
+        result.custom_output = {}
+        return result
 
 
 @pytest.fixture
@@ -325,17 +352,29 @@ def test_generate_images_async_omni_hunyuan_cot_routes_through_stage0(hunyuan_as
     assert response.status_code == 200
 
     engine = hunyuan_async_omni_test_client.app.state.engine_client
-    captured_params = engine.captured_sampling_params_list
-    assert captured_params is not None
-    assert captured_params[0].stop == ["</recaption>", "</answer>", "<|endoftext|>"]
-    assert captured_params[0].include_stop_str_in_output is True
-    assert captured_params[1].extra_args["bot_task"] == "image"
+    assert len(engine.stage_calls) == 3
 
-    captured_prompt = engine.captured_prompt
-    assert captured_prompt["prompt"].endswith("<think>")
-    metadata = captured_prompt["additional_information"]
-    assert metadata["hunyuan_bot_task"] == "think_recaption"
-    assert metadata["hunyuan_original_prompt"]["prompt"] == "a cat wearing a raincoat"
+    think_call, recaption_call, diffusion_call = engine.stage_calls
+    assert think_call["stage_id"] == 0
+    assert think_call["sampling_params"].stop == ["</think>", "</answer>", "<|endoftext|>"]
+    assert think_call["prompt"]["prompt"].endswith("<think>")
+
+    assert recaption_call["stage_id"] == 0
+    assert recaption_call["sampling_params"].stop == ["</recaption>", "</answer>", "<|endoftext|>"]
+    assert recaption_call["prompt"]["prompt"].endswith("<recaption>")
+    assert "</think><recaption>" in recaption_call["prompt"]["prompt"]
+
+    assert diffusion_call["stage_id"] == 1
+    assert diffusion_call["sampling_params"].extra_args["bot_task"] == "image"
+    diffusion_metadata = diffusion_call["prompt"]["additional_information"]
+    assert diffusion_metadata["hunyuan_bot_task"] == "think_recaption"
+    assert diffusion_metadata["hunyuan_cot_text"] == (
+        "<think>reason about the image</think>"
+        "<recaption>storm clouds over the city</recaption>"
+    )
+
+    data = response.json()
+    assert data["data"][0]["revised_prompt"] == "storm clouds over the city"
 
 
 def test_generate_multiple_images(test_client):

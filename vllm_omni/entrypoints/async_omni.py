@@ -436,6 +436,67 @@ class AsyncOmni(OmniBase):
             logger.info("[AsyncOrchestrator] Request %s aborted.", request_id)
             raise
 
+    async def generate_stage(
+        self,
+        stage_id: int,
+        prompt: OmniPromptType,
+        request_id: str,
+        sampling_params: OmniSamplingParams,
+    ) -> Any:
+        """Run a single stage directly and return its raw engine output."""
+        async with self._pause_cond:
+            await self._pause_cond.wait_for(lambda: not self._paused)
+
+        if self._inline_diffusion:
+            if stage_id != 0:
+                raise ValueError(f"Inline diffusion only supports stage_id 0, got {stage_id}")
+            loop = asyncio.get_running_loop()
+            results = await loop.run_in_executor(
+                None,
+                self._inline_engine.generate,
+                prompt,
+                sampling_params,
+                [request_id],
+            )
+            return results[0]
+
+        if stage_id < 0 or stage_id >= len(self.stage_list):
+            raise ValueError(f"Invalid stage_id {stage_id}")
+
+        self._run_output_handler()
+        req_state = ClientRequestState(request_id)
+        self.request_states[request_id] = req_state
+        stage = self.stage_list[stage_id]
+        stage.submit(
+            {
+                "request_id": request_id,
+                "engine_inputs": prompt,
+                "sampling_params": sampling_params,
+            }
+        )
+        try:
+            while True:
+                result = await req_state.queue.get()
+                if result.get("request_id") != request_id:
+                    continue
+                if "error" in result:
+                    raise RuntimeError(result["error"])
+                engine_outputs = _load(result, obj_key="engine_outputs", shm_key="engine_outputs_shm")
+                if isinstance(engine_outputs, list):
+                    engine_outputs = engine_outputs[0]
+                finished = getattr(engine_outputs, "finished", True)
+                logger.debug(
+                    "[%s] Direct stage-%d request %s completed=%s",
+                    self._name,
+                    stage_id,
+                    request_id,
+                    finished,
+                )
+                if finished:
+                    return engine_outputs
+        finally:
+            self.request_states.pop(request_id, None)
+
     async def _generate_inline(
         self,
         prompt: OmniPromptType,

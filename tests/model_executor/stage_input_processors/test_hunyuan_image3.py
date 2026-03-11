@@ -8,6 +8,7 @@ from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
     HUNYUAN_COT_SYSTEM_PROMPT_KEY,
     HUNYUAN_COT_TEXT_KEY,
     ar2diffusion,
+    build_hunyuan_stage0_followup_prompt,
     extract_hunyuan_revised_prompt,
     normalize_hunyuan_cot_text,
     wrap_hunyuan_stage0_prompt,
@@ -77,3 +78,18 @@ def test_normalize_hunyuan_cot_text_accepts_answer_close_as_recaption_end():
 
     assert normalized == "<think>drafting</think><recaption>storm clouds over the city</recaption>"
     assert extract_hunyuan_revised_prompt(normalized) == "storm clouds over the city"
+
+
+def test_build_hunyuan_stage0_followup_prompt_appends_recaption_stage():
+    wrapped = build_hunyuan_stage0_followup_prompt(
+        {
+            "prompt": "replace the sky with a storm",
+            "multi_modal_data": {"image": ["image-a.png"]},
+        },
+        "think_recaption",
+        "<think>reason about the composition</think>",
+    )
+
+    assert wrapped["prompt"].endswith("<recaption>")
+    assert "</think><recaption>" in wrapped["prompt"]
+    assert wrapped["additional_information"][HUNYUAN_BOT_TASK_KEY] == "think_recaption"

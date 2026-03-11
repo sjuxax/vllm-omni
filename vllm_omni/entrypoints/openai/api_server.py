@@ -105,9 +105,13 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.model_executor.stage_input_processors.hunyuan_image3 import (
+    HUNYUAN_COT_SYSTEM_PROMPT_KEY,
+    build_hunyuan_diffusion_prompt,
+    build_hunyuan_stage0_followup_prompt,
     extract_hunyuan_revised_prompt,
     get_hunyuan_first_bot_task,
     is_hunyuan_cot_task,
+    normalize_hunyuan_cot_text,
     wrap_hunyuan_stage0_prompt,
 )
 
@@ -1488,6 +1492,29 @@ def _clone_sampling_params(params: OmniSamplingParams) -> OmniSamplingParams:
     return copy.deepcopy(params)
 
 
+def _default_stage_sampling_params(
+    engine_client: AsyncOmni | Any,
+    stage_types: list[str],
+) -> list[OmniSamplingParams]:
+    default_params_list: list[OmniSamplingParams] | None = getattr(
+        engine_client,
+        "default_sampling_params_list",
+        None,
+    )
+    if not isinstance(default_params_list, list):
+        default_params_list = [
+            OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
+        ]
+    else:
+        default_params_list = list(default_params_list)
+    if len(default_params_list) != len(stage_types):
+        default_params_list = (
+            default_params_list
+            + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
+        )[: len(stage_types)]
+    return default_params_list
+
+
 def _is_hunyuan_two_stage_pipeline(stage_configs: list[Any] | None) -> bool:
     if not isinstance(stage_configs, list) or len(stage_configs) < 2:
         return False
@@ -1518,6 +1545,70 @@ def _prepare_hunyuan_stage0_prompt(
     return wrap_hunyuan_stage0_prompt(prompt, bot_task), str(bot_task)
 
 
+def _extract_stage_text_output(result: Any) -> str:
+    outputs = getattr(result, "outputs", None) or []
+    if not outputs:
+        return ""
+    return getattr(outputs[0], "text", "") or ""
+
+
+async def _generate_hunyuan_two_pass_stage0(
+    engine_client: AsyncOmni,
+    prompt: OmniTextPrompt,
+    request_id: str,
+    gen_params: OmniSamplingParams,
+    stage_types: list[str],
+) -> Any:
+    default_params_list = _default_stage_sampling_params(engine_client, stage_types)
+    stage0_params = _clone_sampling_params(default_params_list[0])
+    stage0_params.include_stop_str_in_output = True
+    stage0_params.detokenize = True
+
+    think_prompt = wrap_hunyuan_stage0_prompt(prompt, "think")
+    think_params = _clone_sampling_params(stage0_params)
+    think_params.stop = ["</think>", "</answer>", "<|endoftext|>"]
+    think_result = await engine_client.generate_stage(
+        stage_id=0,
+        prompt=think_prompt,
+        request_id=f"{request_id}_think",
+        sampling_params=think_params,
+    )
+    think_text = normalize_hunyuan_cot_text(_extract_stage_text_output(think_result), "think")
+
+    recaption_prompt = build_hunyuan_stage0_followup_prompt(prompt, "think_recaption", think_text)
+    recaption_params = _clone_sampling_params(stage0_params)
+    recaption_params.stop = ["</recaption>", "</answer>", "<|endoftext|>"]
+    recaption_result = await engine_client.generate_stage(
+        stage_id=0,
+        prompt=recaption_prompt,
+        request_id=f"{request_id}_recaption",
+        sampling_params=recaption_params,
+    )
+    recaption_text = normalize_hunyuan_cot_text(_extract_stage_text_output(recaption_result), "recaption")
+    cot_text = f"{think_text}{recaption_text}"
+
+    diffusion_params = _clone_sampling_params(gen_params)
+    diffusion_params.extra_args = dict(diffusion_params.extra_args)
+    diffusion_params.extra_args["bot_task"] = "image"
+
+    diffusion_prompt = build_hunyuan_diffusion_prompt(
+        prompt,
+        "think_recaption",
+        cot_text,
+        system_prompt=think_prompt["additional_information"].get(HUNYUAN_COT_SYSTEM_PROMPT_KEY),
+    )
+    result = await engine_client.generate_stage(
+        stage_id=1,
+        prompt=diffusion_prompt,
+        request_id=f"{request_id}_image",
+        sampling_params=diffusion_params,
+    )
+    if hasattr(result, "custom_output"):
+        result.custom_output = dict(getattr(result, "custom_output", {}) or {})
+        result.custom_output["cot_text"] = [cot_text]
+    return result
+
+
 async def _generate_with_async_omni(
     engine_client: AsyncOmni | Any,
     gen_params: Any,
@@ -1529,23 +1620,23 @@ async def _generate_with_async_omni(
     result = None
     stage_list = getattr(engine_client, "stage_list", None)
     prompt = kwargs.get("prompt")
+    if (
+        _is_hunyuan_two_stage_pipeline(stage_configs)
+        and isinstance(prompt, dict)
+        and (getattr(gen_params, "extra_args", {}) or {}).get("bot_task") == "think_recaption"
+        and hasattr(engine_client, "generate_stage")
+    ):
+        return await _generate_hunyuan_two_pass_stage0(
+            engine_client=engine_client,
+            prompt=prompt,
+            request_id=kwargs["request_id"],
+            gen_params=gen_params,
+            stage_types=stage_types,
+        )
     prompt, hunyuan_bot_task = _prepare_hunyuan_stage0_prompt(prompt, gen_params, stage_configs)
     kwargs["prompt"] = prompt
     if isinstance(stage_list, list):
-        default_params_list: list[OmniSamplingParams] | None = getattr(
-            engine_client, "default_sampling_params_list", None
-        )
-        if not isinstance(default_params_list, list):
-            default_params_list = [
-                OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types
-            ]
-        else:
-            default_params_list = list(default_params_list)
-        if len(default_params_list) != len(stage_types):
-            default_params_list = (
-                default_params_list
-                + [OmniDiffusionSamplingParams() if st == "diffusion" else SamplingParams() for st in stage_types]
-            )[: len(stage_types)]
+        default_params_list = _default_stage_sampling_params(engine_client, stage_types)
 
         sampling_params_list: list[OmniSamplingParams] = []
         for idx, stage_type in enumerate(stage_types):

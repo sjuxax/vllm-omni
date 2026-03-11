@@ -62,19 +62,12 @@ def wrap_hunyuan_stage0_prompt(
     system_prompt = get_system_prompt(sys_type="dynamic", bot_task=first_bot_task)
     multimodal = original_prompt.get("multi_modal_data") or {}
     image_count = _count_input_images(multimodal)
-    assistant_prefix = "<think>" if first_bot_task == "think" else "<recaption>"
-
-    # Hunyuan's pretrain template concatenates the system prompt, image markers,
-    # user text, and assistant prefix directly.
-    stage0_prompt_text = "".join(
-        part
-        for part in (
-            system_prompt or "",
-            "<img>" * image_count,
-            prompt_text,
-            assistant_prefix,
-        )
-        if part
+    assistant_prefix = _THINK_OPEN if first_bot_task == "think" else _RECAPTION_OPEN
+    stage0_prompt_text = _build_stage0_prompt_text(
+        prompt_text=prompt_text,
+        image_count=image_count,
+        system_prompt=system_prompt,
+        assistant_prefix=assistant_prefix,
     )
 
     wrapped_prompt: OmniTextPrompt = {"prompt": stage0_prompt_text}
@@ -91,6 +84,74 @@ def wrap_hunyuan_stage0_prompt(
     additional_information[HUNYUAN_COT_SYSTEM_PROMPT_KEY] = system_prompt
     wrapped_prompt["additional_information"] = additional_information
     return wrapped_prompt
+
+
+def build_hunyuan_stage0_followup_prompt(
+    prompt: Mapping[str, Any] | str,
+    bot_task: str,
+    cot_prefix_text: str,
+) -> OmniTextPrompt:
+    """Build the second-stage AR prompt for staged think_recaption requests."""
+    if isinstance(prompt, Mapping):
+        original_prompt: dict[str, Any] = dict(prompt)
+    else:
+        original_prompt = {"prompt": prompt}
+
+    prompt_text = str(original_prompt.get("prompt") or "")
+    first_bot_task = get_hunyuan_first_bot_task(bot_task)
+    system_prompt = get_system_prompt(sys_type="dynamic", bot_task=first_bot_task)
+    multimodal = original_prompt.get("multi_modal_data") or {}
+    image_count = _count_input_images(multimodal)
+
+    stage0_prompt_text = _build_stage0_prompt_text(
+        prompt_text=prompt_text,
+        image_count=image_count,
+        system_prompt=system_prompt,
+        cot_prefix_text=cot_prefix_text,
+        assistant_prefix=_RECAPTION_OPEN,
+    )
+
+    wrapped_prompt: OmniTextPrompt = {"prompt": stage0_prompt_text}
+    if original_prompt.get("multi_modal_data") is not None:
+        wrapped_prompt["multi_modal_data"] = original_prompt["multi_modal_data"]
+    if original_prompt.get("negative_prompt") is not None:
+        wrapped_prompt["negative_prompt"] = original_prompt["negative_prompt"]
+
+    additional_information = _copy_additional_information(original_prompt)
+    original_prompt_payload = _copy_prompt_payload(original_prompt)
+    original_prompt_payload.pop("multi_modal_data", None)
+    additional_information[HUNYUAN_ORIGINAL_PROMPT_KEY] = original_prompt_payload
+    additional_information[HUNYUAN_BOT_TASK_KEY] = bot_task
+    additional_information[HUNYUAN_COT_SYSTEM_PROMPT_KEY] = system_prompt
+    wrapped_prompt["additional_information"] = additional_information
+    return wrapped_prompt
+
+
+def build_hunyuan_diffusion_prompt(
+    prompt: Mapping[str, Any] | str,
+    bot_task: str,
+    cot_text: str,
+    *,
+    system_prompt: str | None = None,
+) -> OmniTextPrompt:
+    """Build a direct stage-1 diffusion prompt from finalized CoT text."""
+    original_prompt = _prompt_to_dict(prompt)
+    diffusion_prompt: OmniTextPrompt = {
+        "prompt": str(original_prompt.get("prompt") or ""),
+    }
+    if original_prompt.get("negative_prompt") is not None:
+        diffusion_prompt["negative_prompt"] = original_prompt["negative_prompt"]
+    if original_prompt.get("multi_modal_data") is not None:
+        diffusion_prompt["multi_modal_data"] = original_prompt["multi_modal_data"]
+
+    additional_information = _copy_additional_information(original_prompt)
+    additional_information[HUNYUAN_BOT_TASK_KEY] = bot_task
+    additional_information[HUNYUAN_COT_TEXT_KEY] = cot_text
+    if system_prompt is not None:
+        additional_information[HUNYUAN_COT_SYSTEM_PROMPT_KEY] = system_prompt
+    if additional_information:
+        diffusion_prompt["additional_information"] = additional_information
+    return diffusion_prompt
 
 
 def ar2diffusion(
@@ -186,6 +247,7 @@ def sanitize_hunyuan_cot_text(generated_text: str, bot_task: str) -> str:
         text if _THINK_OPEN in text else f"{_THINK_OPEN}{text}",
         _THINK_OPEN,
         _THINK_CLOSE,
+        fallback_end_tags=("</answer>", "<|endoftext|>", _RECAPTION_OPEN),
     ) if first_bot_task == "think" else None
 
     recaption_source = text
@@ -249,6 +311,29 @@ def _count_input_images(multimodal: Mapping[str, Any]) -> int:
     return 1
 
 
+def _build_stage0_prompt_text(
+    *,
+    prompt_text: str,
+    image_count: int,
+    system_prompt: str | None,
+    assistant_prefix: str,
+    cot_prefix_text: str = "",
+) -> str:
+    # Hunyuan's pretrain template concatenates system prompt, image markers,
+    # user text, any prior CoT text, and the next assistant prefix directly.
+    return "".join(
+        part
+        for part in (
+            system_prompt or "",
+            "<img>" * image_count,
+            prompt_text,
+            cot_prefix_text,
+            assistant_prefix,
+        )
+        if part
+    )
+
+
 def _copy_additional_information(prompt_dict: Mapping[str, Any]) -> dict[str, Any]:
     additional_information = prompt_dict.get("additional_information")
     if isinstance(additional_information, Mapping):
@@ -278,6 +363,8 @@ __all__ = [
     "HUNYUAN_COT_TEXT_KEY",
     "HUNYUAN_ORIGINAL_PROMPT_KEY",
     "ar2diffusion",
+    "build_hunyuan_diffusion_prompt",
+    "build_hunyuan_stage0_followup_prompt",
     "extract_hunyuan_revised_prompt",
     "get_hunyuan_first_bot_task",
     "is_hunyuan_cot_task",
